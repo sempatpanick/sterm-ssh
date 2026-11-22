@@ -352,19 +352,32 @@ impl ThemePalette {
 }
 
 /// Converts a `vt100::Color` (Default, 256-color indexed, or 24-bit RGB) into GPUI `Hsla`.
-pub fn vt_color_to_hsla(color: vt100::Color, fallback: Hsla) -> Hsla {
+///
+/// When `contrast_for_light_bg` is `true` (foreground text rendered over a light terminal
+/// background such as `AntigravityLight`), ANSI 16 colors use a high-contrast light-mode
+/// palette and overly pale 256-color / RGB foregrounds are darkened so text never disappears
+/// on white backgrounds.
+pub fn vt_color_to_hsla(
+    color: vt100::Color,
+    fallback: Hsla,
+    contrast_for_light_bg: bool,
+) -> Hsla {
     match color {
         vt100::Color::Default => fallback,
         vt100::Color::Rgb(r, g, b) => {
             let hex = ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
-            rgb(hex).into()
+            let mut c: Hsla = rgb(hex).into();
+            if contrast_for_light_bg && c.l > 0.58 {
+                c.l = 0.42;
+            }
+            c
         }
-        vt100::Color::Idx(idx) => ansi_256_to_hsla(idx),
+        vt100::Color::Idx(idx) => ansi_256_to_hsla(idx, contrast_for_light_bg),
     }
 }
 
-fn ansi_256_to_hsla(idx: u8) -> Hsla {
-    const ANSI_16: [u32; 16] = [
+fn ansi_256_to_hsla(idx: u8, contrast_for_light_bg: bool) -> Hsla {
+    const ANSI_16_DARK: [u32; 16] = [
         0x1E293B, // 0 black
         0xF87171, // 1 red
         0x34D399, // 2 green
@@ -383,21 +396,50 @@ fn ansi_256_to_hsla(idx: u8) -> Hsla {
         0xFFFFFF, // 15 bright white
     ];
 
+    const ANSI_16_LIGHT: [u32; 16] = [
+        0x1E293B, // 0 black
+        0xDC2626, // 1 red
+        0x15803D, // 2 green
+        0xB45309, // 3 yellow/amber
+        0x1D4ED8, // 4 blue
+        0x7E22CE, // 5 magenta
+        0x0E7490, // 6 cyan
+        0x334155, // 7 white (ink slate on light bg)
+        0x64748B, // 8 bright black (muted slate)
+        0xB91C1C, // 9 bright red
+        0x166534, // 10 bright green
+        0x92400E, // 11 bright yellow
+        0x1E40AF, // 12 bright blue
+        0x6B21A8, // 13 bright magenta
+        0x155E75, // 14 bright cyan
+        0x0F172A, // 15 bright white (high-contrast ink on light bg)
+    ];
+
     if idx < 16 {
-        return rgb(ANSI_16[idx as usize]).into();
+        let table = if contrast_for_light_bg {
+            &ANSI_16_LIGHT
+        } else {
+            &ANSI_16_DARK
+        };
+        return rgb(table[idx as usize]).into();
     }
-    if idx < 232 {
+    let mut color: Hsla = if idx < 232 {
         let i = idx - 16;
         let r = i / 36;
         let g = (i % 36) / 6;
         let b = i % 6;
         let to_u8 = |v: u8| if v == 0 { 0u32 } else { 55 + (v as u32) * 40 };
         let hex = (to_u8(r) << 16) | (to_u8(g) << 8) | to_u8(b);
-        return rgb(hex).into();
+        rgb(hex).into()
+    } else {
+        let gray = 8 + ((idx - 232) as u32) * 10;
+        let hex = (gray << 16) | (gray << 8) | gray;
+        rgb(hex).into()
+    };
+    if contrast_for_light_bg && color.l > 0.58 {
+        color.l = 0.42;
     }
-    let gray = 8 + ((idx - 232) as u32) * 10;
-    let hex = (gray << 16) | (gray << 8) | gray;
-    rgb(hex).into()
+    color
 }
 
 pub fn format_bytes(bytes: u64) -> String {
@@ -436,5 +478,21 @@ mod tests {
             Some("DEV")
         );
         assert!(env_badge_for_host(&["db".into()], Some("Internal"), &t).is_none());
+    }
+
+    #[test]
+    fn vt_color_adapts_ansi_and_pale_foregrounds_for_light_terminal_bg() {
+        let dark_fg: Hsla = rgb(0xE2E8F0).into();
+        let light_fg: Hsla = rgb(0x1F1F1F).into();
+
+        // On dark terminal background, ANSI white (7) & bright white (15) stay bright
+        assert!(vt_color_to_hsla(vt100::Color::Idx(7), dark_fg, false).l > 0.8);
+        assert!(vt_color_to_hsla(vt100::Color::Idx(15), dark_fg, false).l > 0.95);
+
+        // On light terminal background, ANSI white (7), bright white (15), and pale 256-colors darken for contrast
+        assert!(vt_color_to_hsla(vt100::Color::Idx(7), light_fg, true).l < 0.35);
+        assert!(vt_color_to_hsla(vt100::Color::Idx(15), light_fg, true).l < 0.15);
+        assert!(vt_color_to_hsla(vt100::Color::Idx(75), light_fg, true).l <= 0.43);
+        assert!(vt_color_to_hsla(vt100::Color::Rgb(245, 245, 245), light_fg, true).l <= 0.43);
     }
 }

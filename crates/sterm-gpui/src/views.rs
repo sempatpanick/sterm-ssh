@@ -15,7 +15,7 @@ use crate::sftp::{
     direction_arrow, transfer_percent, DragFilePill, DraggedSftpFile, SftpPaneSide,
 };
 use crate::split_tree::{SplitDirection, SplitNode};
-use crate::theme::{env_badge_for_host, format_bytes, ThemePalette};
+use crate::theme::{env_badge_for_host, format_bytes, TerminalThemeId, ThemePalette};
 
 impl StermAdminApp {
     // =========================================================================
@@ -1337,6 +1337,12 @@ impl StermAdminApp {
             is_active && term_focused,
             self.services.ui_tx.clone(),
         );
+        let pane_term_bg: gpui::Hsla = pane
+            .theme_id
+            .as_deref()
+            .and_then(TerminalThemeId::from_slug)
+            .map(|tid| gpui::rgb(tid.colors().0).into())
+            .unwrap_or(t.terminal_bg);
 
         let pane_border = if broadcast_input {
             t.warning
@@ -1848,6 +1854,11 @@ impl StermAdminApp {
                     .flex_1()
                     .min_h_0()
                     .min_w_0()
+                    .bg(pane_term_bg)
+                    .px_2p5()
+                    .py_2()
+                    .flex()
+                    .flex_col()
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, ev, window, cx| {
