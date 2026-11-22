@@ -10,6 +10,7 @@ pub enum EntityType {
     Credential,
     KnownHost,
     Snippet,
+    PortForward,
 }
 
 impl EntityType {
@@ -20,6 +21,7 @@ impl EntityType {
             Self::Credential => "credential",
             Self::KnownHost => "known_host",
             Self::Snippet => "snippet",
+            Self::PortForward => "port_forward",
         }
     }
 
@@ -30,6 +32,7 @@ impl EntityType {
             "credential" => Some(Self::Credential),
             "known_host" => Some(Self::KnownHost),
             "snippet" => Some(Self::Snippet),
+            "port_forward" => Some(Self::PortForward),
             _ => None,
         }
     }
@@ -147,6 +150,29 @@ pub struct CommandRecord {
     pub updated_at: i64,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PortForwardKind {
+    Local,
+    Remote,
+    DynamicSocks5,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PortForwardRecord {
+    pub id: String,
+    pub label: String,
+    pub host_id: String,
+    pub kind: PortForwardKind,
+    pub bind_address: String,
+    pub bind_port: u16,
+    pub target_host: Option<String>,
+    pub target_port: Option<u16>,
+    #[serde(default)]
+    pub auto_start: bool,
+    pub updated_at: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VaultStatus {
     pub initialized: bool,
@@ -162,6 +188,8 @@ pub struct VaultSnapshot {
     pub credentials: Vec<CredentialSummary>,
     pub known_hosts: Vec<KnownHostRecord>,
     pub commands: Vec<CommandRecord>,
+    #[serde(default)]
+    pub port_forwards: Vec<PortForwardRecord>,
 }
 
 /// Wire-ready opaque encrypted envelope used for cross-platform zero-knowledge sync.

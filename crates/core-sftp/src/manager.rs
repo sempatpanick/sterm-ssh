@@ -204,6 +204,90 @@ impl SftpManager {
         Ok((resolved, entries))
     }
 
+    pub async fn remote_exists(&self, session_id: &str, remote_path: &str) -> SftpResult<bool> {
+        let sftp = self.get_session(session_id)?;
+        Ok(sftp.try_exists(remote_path).await.unwrap_or(false))
+    }
+
+    /// Recursively uploads a local directory tree to `remote_dir`, streaming each file
+    /// with live progress notifications and returning the total uploaded file count.
+    pub async fn upload_dir_recursive<F>(
+        &self,
+        session_id: &str,
+        local_dir: &Path,
+        remote_dir: &str,
+        mut on_progress: F,
+    ) -> SftpResult<usize>
+    where
+        F: FnMut(TransferProgress) + Send + 'static,
+    {
+        let mut queue = vec![(local_dir.to_path_buf(), remote_dir.to_string())];
+        let mut uploaded_files = 0usize;
+
+        while let Some((cur_local, cur_remote)) = queue.pop() {
+            // Best-effort mkdir (ignore if directory already exists)
+            let _ = self.remote_mkdir(session_id, &cur_remote).await;
+
+            let mut rd = tokio::fs::read_dir(&cur_local).await?;
+            while let Some(ent) = rd.next_entry().await? {
+                let name = ent.file_name().to_string_lossy().to_string();
+                let child_local = ent.path();
+                let child_remote = if cur_remote == "/" {
+                    format!("/{name}")
+                } else {
+                    format!("{}/{name}", cur_remote.trim_end_matches('/'))
+                };
+                let meta = match ent.metadata().await {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                if meta.is_dir() {
+                    queue.push((child_local, child_remote));
+                } else if meta.is_file() {
+                    self.upload_file(session_id, &child_local, &child_remote, &mut on_progress)
+                        .await?;
+                    uploaded_files += 1;
+                }
+            }
+        }
+        Ok(uploaded_files)
+    }
+
+    /// Recursively downloads a remote directory tree to `local_dir`, streaming each file
+    /// with live progress notifications and returning the total downloaded file count.
+    pub async fn download_dir_recursive<F>(
+        &self,
+        session_id: &str,
+        remote_dir: &str,
+        local_dir: &Path,
+        mut on_progress: F,
+    ) -> SftpResult<usize>
+    where
+        F: FnMut(TransferProgress) + Send + 'static,
+    {
+        let mut queue = vec![(remote_dir.to_string(), local_dir.to_path_buf())];
+        let mut downloaded_files = 0usize;
+
+        while let Some((cur_remote, cur_local)) = queue.pop() {
+            tokio::fs::create_dir_all(&cur_local).await?;
+            let (_, entries) = self.list_remote_dir(session_id, &cur_remote).await?;
+            for entry in entries {
+                if entry.is_symlink {
+                    continue;
+                }
+                let child_local = cur_local.join(&entry.name);
+                if entry.is_dir {
+                    queue.push((entry.path, child_local));
+                } else {
+                    self.download_file(session_id, &entry.path, &child_local, &mut on_progress)
+                        .await?;
+                    downloaded_files += 1;
+                }
+            }
+        }
+        Ok(downloaded_files)
+    }
+
     pub async fn remote_mkdir(&self, session_id: &str, remote_path: &str) -> SftpResult<()> {
         let sftp = self.get_session(session_id)?;
         sftp.create_dir(remote_path)

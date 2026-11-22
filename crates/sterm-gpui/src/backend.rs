@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -12,13 +12,13 @@ use core_crypto::{
 };
 use core_sftp::{
     manager::SftpManager,
-    types::{FileEntry, TransferProgress},
+    types::{FileEntry, TransferDirection, TransferProgress},
 };
 use core_ssh::{
     manager::{HostKeyVerifier, SshSessionManager},
     types::{
         ConnectRequest, HostKeyChallenge, KeyboardInteractiveChallenge, SshAuthMethod, SshTarget,
-        TerminalEvent,
+        TerminalEvent, TunnelStats,
     },
 };
 use core_sync::{
@@ -35,6 +35,8 @@ use core_vault::{
     store::VaultStore,
 };
 use tokio::sync::mpsc;
+
+use crate::local_shell::LocalShellManager;
 
 /// Events pushed from Tokio async SSH/SFTP/Sync tasks to the GPUI UI loop.
 #[derive(Debug, Clone)]
@@ -105,6 +107,37 @@ pub enum UiEvent {
     },
     SyncAccountDeleted,
     LocalSshDiscovered(LocalSshDiscovery),
+    TunnelStarted {
+        tunnel_id: String,
+        session_id: String,
+        bound_port: u16,
+        label: String,
+    },
+    TunnelStopped {
+        tunnel_id: String,
+        label: String,
+    },
+    TunnelError {
+        tunnel_id: String,
+        message: String,
+    },
+    TunnelStatsSnapshot(Vec<TunnelStats>),
+    KeyDeployed {
+        host_label: String,
+        result: Result<String, String>,
+    },
+    SftpOverwriteCheck {
+        direction: TransferDirection,
+        local_path: String,
+        remote_path: String,
+        name: String,
+        exists: bool,
+    },
+    AutoReconnectTrigger {
+        pane_id: String,
+        attempt: u32,
+    },
+    IdleLockTick,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -135,11 +168,14 @@ pub struct BackendServices {
     pub vault: Arc<Mutex<VaultStore>>,
     pub ssh: Arc<SshSessionManager>,
     pub sftp: Arc<SftpManager>,
+    pub local_shells: LocalShellManager,
     pub _sync_client: Arc<SyncClient>,
     pub sync_session: Arc<Mutex<Option<SyncSessionInfo>>>,
     pub ui_tx: mpsc::UnboundedSender<UiEvent>,
     /// Tracks SSH sessions opened solely for standalone SFTP (without a terminal tab).
     pub sftp_only_sessions: Arc<Mutex<HashSet<String>>>,
+    /// Tracks SSH transport sessions opened specifically for Port Forwarding tunnels (`tunnel_id -> session_id`).
+    pub tunnel_only_sessions: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl BackendServices {
@@ -181,10 +217,12 @@ impl BackendServices {
             vault: Arc::new(Mutex::new(vault)),
             ssh: Arc::new(SshSessionManager::new()),
             sftp: Arc::new(SftpManager::new()),
+            local_shells: LocalShellManager::new(),
             _sync_client: Arc::new(SyncClient::new()),
             sync_session: Arc::new(Mutex::new(saved_sync)),
             ui_tx,
             sftp_only_sessions: Arc::new(Mutex::new(HashSet::new())),
+            tunnel_only_sessions: Arc::new(Mutex::new(HashMap::new())),
         });
 
         (services, ui_rx)
@@ -899,10 +937,29 @@ pub async fn run_sync_delete_account(
     Ok(())
 }
 
+/// Builds a safe, idempotent POSIX shell command to deploy an OpenSSH public key to
+/// `~/.ssh/authorized_keys` (1-click `ssh-copy-id`), with single-quote shell escaping.
+pub fn build_ssh_copy_id_command(public_key: &str) -> String {
+    let trimmed = public_key.trim().replace(['\r', '\n'], "");
+    let escaped = trimmed.replace('\'', "'\"'\"'");
+    format!(
+        "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && (grep -qxF '{escaped}' ~/.ssh/authorized_keys || printf '%s\\n' '{escaped}' >> ~/.ssh/authorized_keys)"
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::is_ssh_auth_error;
+    use super::{build_ssh_copy_id_command, is_ssh_auth_error};
     use core_ssh::SshError;
+
+    #[test]
+    fn ssh_copy_id_command_escapes_quotes_and_sets_strict_perms() {
+        let cmd = build_ssh_copy_id_command("ssh-ed25519 AAAAC3Nza user's@host\n");
+        assert!(cmd.contains("chmod 700 ~/.ssh"));
+        assert!(cmd.contains("chmod 600 ~/.ssh/authorized_keys"));
+        assert!(cmd.contains("user'\"'\"'s@host"));
+        assert!(!cmd.contains('\n'));
+    }
 
     #[test]
     fn ssh_auth_error_distinguishes_auth_from_network_errors() {

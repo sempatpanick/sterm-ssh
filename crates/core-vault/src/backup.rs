@@ -8,7 +8,10 @@ use core_crypto::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    models::{CommandRecord, CredentialRecord, GroupRecord, HostRecord, KnownHostRecord},
+    models::{
+        CommandRecord, CredentialRecord, GroupRecord, HostRecord, KnownHostRecord,
+        PortForwardRecord,
+    },
     store::VaultStore,
     VaultError, VaultResult,
 };
@@ -33,6 +36,8 @@ struct BackupPayload {
     known_hosts: Vec<KnownHostRecord>,
     #[serde(default)]
     commands: Vec<CommandRecord>,
+    #[serde(default)]
+    port_forwards: Vec<PortForwardRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,6 +46,8 @@ pub struct BackupImportReport {
     pub groups: usize,
     pub credentials: usize,
     pub known_hosts: usize,
+    #[serde(default)]
+    pub port_forwards: usize,
 }
 
 pub fn export_encrypted_backup(
@@ -54,6 +61,7 @@ pub fn export_encrypted_backup(
         credentials: store.list_credentials_full()?,
         known_hosts: store.list_known_hosts()?,
         commands: store.list_commands()?,
+        port_forwards: store.list_port_forwards()?,
     };
     let plaintext = serde_json::to_vec(&payload)?;
     let salt = generate_salt();
@@ -110,6 +118,7 @@ pub fn import_encrypted_backup(
         groups: 0,
         credentials: 0,
         known_hosts: 0,
+        port_forwards: 0,
     };
 
     for g in payload.groups {
@@ -130,6 +139,10 @@ pub fn import_encrypted_backup(
     }
     for cmd in payload.commands {
         store.upsert_command(cmd)?;
+    }
+    for pf in payload.port_forwards {
+        store.upsert_port_forward(pf)?;
+        report.port_forwards += 1;
     }
 
     Ok(report)

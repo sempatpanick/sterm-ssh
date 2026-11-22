@@ -589,6 +589,24 @@ impl VaultStore {
         })
     }
 
+    // --- SSH Port Forwards (-L / -R / -D SOCKS5) ---
+    pub fn upsert_port_forward(&self, mut pf: crate::models::PortForwardRecord) -> VaultResult<crate::models::PortForwardRecord> {
+        if pf.id.is_empty() {
+            pf.id = Uuid::now_v7().to_string();
+        }
+        pf.updated_at = Utc::now().timestamp_millis();
+        self.put_item(&pf.id, EntityType::PortForward, &pf, pf.updated_at)?;
+        Ok(pf)
+    }
+
+    pub fn list_port_forwards(&self) -> VaultResult<Vec<crate::models::PortForwardRecord>> {
+        self.list_items(EntityType::PortForward)
+    }
+
+    pub fn get_port_forward(&self, id: &str) -> VaultResult<crate::models::PortForwardRecord> {
+        self.get_item(id, EntityType::PortForward)
+    }
+
     pub fn snapshot(&self) -> VaultResult<VaultSnapshot> {
         Ok(VaultSnapshot {
             hosts: self.list_hosts()?,
@@ -596,6 +614,7 @@ impl VaultStore {
             credentials: self.list_credentials_summary()?,
             known_hosts: self.list_known_hosts()?,
             commands: self.list_commands()?,
+            port_forwards: self.list_port_forwards()?,
         })
     }
 
@@ -799,5 +818,24 @@ mod tests {
         store.soft_delete_item(&host.id).expect("delete");
         assert!(store.list_hosts().unwrap().is_empty());
         assert!(!store.list_dirty_envelopes().unwrap().is_empty());
+
+        // Port forwards CRUD & snapshot inclusion
+        let pf = store
+            .upsert_port_forward(crate::models::PortForwardRecord {
+                id: String::new(),
+                label: "Postgres DB".into(),
+                host_id: host.id.clone(),
+                kind: crate::models::PortForwardKind::Local,
+                bind_address: "127.0.0.1".into(),
+                bind_port: 15432,
+                target_host: Some("127.0.0.1".into()),
+                target_port: Some(5432),
+                auto_start: false,
+                updated_at: 0,
+            })
+            .expect("upsert port forward");
+        assert_eq!(store.list_port_forwards().unwrap().len(), 1);
+        assert_eq!(store.get_port_forward(&pf.id).unwrap().bind_port, 15432);
+        assert_eq!(store.snapshot().unwrap().port_forwards.len(), 1);
     }
 }

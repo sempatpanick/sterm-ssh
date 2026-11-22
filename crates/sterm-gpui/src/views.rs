@@ -1,20 +1,21 @@
 use std::time::Duration;
 
 use core_sftp::types::TransferStatus;
-use core_vault::models::CredentialKind;
+use core_vault::models::{CredentialKind, PortForwardKind};
 use gpui::{
     div, ease_out_quint, prelude::*, px, relative, uniform_list, Animation, AnimationExt as _,
     AnyElement, ClipboardItem, Context, ExternalPaths, FontWeight, MouseButton, Window,
 };
 
-use crate::app::{ActiveModal, AuthScreenMode, ConfirmAction, StermAdminApp};
+use crate::app::{ActiveModal, AdminPage, AuthScreenMode, ConfirmAction, StermAdminApp};
 use crate::command_suggestions::SuggestionSource;
+use crate::icons::{icon_svg, Icon};
 use crate::motion::{indeterminate_bar, loading_dots, loading_dots_indexed};
 use crate::sftp::{
     direction_arrow, transfer_percent, DragFilePill, DraggedSftpFile, SftpPaneSide,
 };
 use crate::split_tree::{SplitDirection, SplitNode};
-use crate::theme::{format_bytes, ThemePalette};
+use crate::theme::{env_badge_for_host, format_bytes, ThemePalette};
 
 impl StermAdminApp {
     // =========================================================================
@@ -747,6 +748,8 @@ impl StermAdminApp {
                                 let is_live = self.terminal_tabs.iter().any(|p| {
                                     p.host_id.as_deref() == Some(h.id.as_str()) && p.connected
                                 });
+                                let env_badge =
+                                    env_badge_for_host(&h.tags, group_name.as_deref(), t);
 
                                 let hid_ssh = h.id.clone();
                                 let hid_sftp = h.id.clone();
@@ -765,7 +768,7 @@ impl StermAdminApp {
                                     .grid_cols(12)
                                     .gap_2()
                                     .items_center()
-                                    // Col 1: Server Name + ProxyJump badge
+                                    // Col 1: Server Name + Env Badge + ProxyJump badge
                                     .child(
                                         div()
                                             .col_span(3)
@@ -792,11 +795,46 @@ impl StermAdminApp {
                                                     .min_w_0()
                                                     .child(
                                                         div()
-                                                            .text_xs()
-                                                            .font_weight(FontWeight::SEMIBOLD)
-                                                            .text_color(t.text_primary)
-                                                            .truncate()
-                                                            .child(h.label.clone()),
+                                                            .flex()
+                                                            .items_center()
+                                                            .gap_1p5()
+                                                            .min_w_0()
+                                                            .child(
+                                                                div()
+                                                                    .text_xs()
+                                                                    .font_weight(
+                                                                        FontWeight::SEMIBOLD,
+                                                                    )
+                                                                    .text_color(t.text_primary)
+                                                                    .truncate()
+                                                                    .child(h.label.clone()),
+                                                            )
+                                                            .when_some(
+                                                                env_badge,
+                                                                |el, (ecol, elbl)| {
+                                                                    let ebg = match elbl {
+                                                                        "PROD" => t.danger_soft,
+                                                                        "STAGING" => t.warning_soft,
+                                                                        _ => t.success_soft,
+                                                                    };
+                                                                    el.child(
+                                                                        div()
+                                                                            .px_1()
+                                                                            .py(px(1.0))
+                                                                            .rounded_sm()
+                                                                            .flex_shrink_0()
+                                                                            .bg(ebg)
+                                                                            .border_1()
+                                                                            .border_color(ecol)
+                                                                            .text_size(px(9.0))
+                                                                            .font_weight(
+                                                                                FontWeight::BOLD,
+                                                                            )
+                                                                            .text_color(ecol)
+                                                                            .child(elbl),
+                                                                    )
+                                                                },
+                                                            ),
                                                     )
                                                     .when_some(jump_label, |s, jl| {
                                                         s.child(
@@ -1012,32 +1050,56 @@ impl StermAdminApp {
         let term_focused = self.terminal_focus.is_focused(window);
         div()
             .size_full()
+            .flex()
+            .flex_col()
+            .gap_2()
             .track_focus(&self.terminal_focus)
             .on_key_down(cx.listener(Self::handle_terminal_key_down))
-            .child(self.render_split_node(
-                &ws.id,
-                &ws.active_pane_id,
-                &ws.root,
-                t,
-                term_focused,
-                cx,
-            ))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .child(self.render_split_node(
+                        &ws.id,
+                        &ws.active_pane_id,
+                        ws.broadcast_input,
+                        &ws.root,
+                        t,
+                        term_focused,
+                        cx,
+                    )),
+            )
+            .when(self.sftp_drawer_open, |el| {
+                el.child(self.render_sftp_drawer(t, cx))
+            })
             .into_any_element()
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "GPUI recursive split-tree renderer needs explicit workspace flags"
+    )]
     fn render_split_node(
         &self,
         ws_id: &str,
         active_pane_id: &str,
+        broadcast_input: bool,
         node: &SplitNode,
         t: &ThemePalette,
         term_focused: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         match node {
-            SplitNode::Leaf { pane_id } => {
-                self.render_terminal_pane(ws_id, pane_id, pane_id == active_pane_id, t, term_focused, cx)
-            }
+            SplitNode::Leaf { pane_id } => self.render_terminal_pane(
+                ws_id,
+                pane_id,
+                pane_id == active_pane_id,
+                broadcast_input,
+                t,
+                term_focused,
+                cx,
+            ),
             SplitNode::Split {
                 id,
                 direction,
@@ -1045,10 +1107,24 @@ impl StermAdminApp {
                 first,
                 second,
             } => {
-                let first_el =
-                    self.render_split_node(ws_id, active_pane_id, first, t, term_focused, cx);
-                let second_el =
-                    self.render_split_node(ws_id, active_pane_id, second, t, term_focused, cx);
+                let first_el = self.render_split_node(
+                    ws_id,
+                    active_pane_id,
+                    broadcast_input,
+                    first,
+                    t,
+                    term_focused,
+                    cx,
+                );
+                let second_el = self.render_split_node(
+                    ws_id,
+                    active_pane_id,
+                    broadcast_input,
+                    second,
+                    t,
+                    term_focused,
+                    cx,
+                );
                 let ws_dec = ws_id.to_string();
                 let ws_inc = ws_id.to_string();
                 let sid_dec = id.clone();
@@ -1172,11 +1248,13 @@ impl StermAdminApp {
         }
     }
 
+    #[expect(clippy::too_many_arguments, reason = "GPUI terminal pane renderer needs explicit workspace/pane flags")]
     fn render_terminal_pane(
         &self,
         ws_id: &str,
         pane_id: &str,
         is_active: bool,
+        broadcast_input: bool,
         t: &ThemePalette,
         term_focused: bool,
         cx: &mut Context<Self>,
@@ -1188,6 +1266,8 @@ impl StermAdminApp {
         let is_connecting = !pane.connected && pane.status_line == "Connecting...";
         let show_auth_retry = !pane.connected && pane.is_auth_error;
         let has_selection = pane.has_selection();
+        let is_recording = pane.transcript_file.is_some();
+        let is_local = pane.is_local;
         let scrollback_off = pane.scrollback_offset();
         let hovered_url = pane.hovered_url.as_ref().map(|u| u.url.clone());
         let match_count = pane.search_matches.len();
@@ -1197,6 +1277,15 @@ impl StermAdminApp {
             0
         };
         let cursor_bottom = pane.cursor_in_bottom_half();
+
+        let env_stripe = pane.env_label.map(|lbl| {
+            let (col, soft) = match lbl {
+                "PROD" => (t.danger, t.danger_soft),
+                "STAGING" => (t.warning, t.warning_soft),
+                _ => (t.success, t.success_soft),
+            };
+            (lbl, col, soft)
+        });
 
         let (suggestions, sug_visible, _, _) = if is_active {
             self.suggestions_for_active_pane()
@@ -1211,8 +1300,15 @@ impl StermAdminApp {
         let pid_copy = pid_str.clone();
         let pid_paste = pid_str.clone();
         let pid_clear = pid_str.clone();
-        let sid_sftp = pane.session_id.clone();
+        let sid_sftp = if is_local {
+            None
+        } else {
+            pane.session_id.clone()
+        };
         let lbl_sftp = pane.label.clone();
+        let ws_bcast = ws_str.clone();
+        let pid_log = pid_str.clone();
+        let pid_drawer = pid_str.clone();
         let ws_spl_h = ws_str.clone();
         let pid_spl_h = pid_str.clone();
         let ws_spl_v = ws_str.clone();
@@ -1242,6 +1338,14 @@ impl StermAdminApp {
             self.services.ui_tx.clone(),
         );
 
+        let pane_border = if broadcast_input {
+            t.warning
+        } else if is_active {
+            t.accent
+        } else {
+            t.border
+        };
+
         div()
             .size_full()
             .min_w_0()
@@ -1249,10 +1353,14 @@ impl StermAdminApp {
             .rounded_xl()
             .bg(t.bg_card)
             .border_1()
-            .border_color(if is_active { t.accent } else { t.border })
+            .border_color(pane_border)
             .overflow_hidden()
             .flex()
             .flex_col()
+            // Environment Safety Color Stripe (PROD=red, STAGING=amber, DEV/LOCAL=green)
+            .when_some(env_stripe, |el, (_, col, _)| {
+                el.child(div().h(px(3.0)).w_full().flex_shrink_0().bg(col))
+            })
             // Compact 32px Pane Header
             .child(
                 div()
@@ -1272,7 +1380,7 @@ impl StermAdminApp {
                             .items_center()
                             .gap_1p5()
                             .min_w_0()
-                            .child(div().w(px(7.0)).h(px(7.0)).rounded_full().bg(
+                            .child(div().w(px(7.0)).h(px(7.0)).rounded_full().flex_shrink_0().bg(
                                 if pane.connected {
                                     t.success
                                 } else if is_connecting {
@@ -1281,6 +1389,22 @@ impl StermAdminApp {
                                     t.danger
                                 },
                             ))
+                            .when_some(env_stripe, |el, (lbl, col, soft)| {
+                                el.child(
+                                    div()
+                                        .px_1()
+                                        .py(px(1.0))
+                                        .rounded_sm()
+                                        .flex_shrink_0()
+                                        .bg(soft)
+                                        .border_1()
+                                        .border_color(col)
+                                        .text_size(px(9.0))
+                                        .font_weight(FontWeight::BOLD)
+                                        .text_color(col)
+                                        .child(lbl),
+                                )
+                            })
                             .child(
                                 div()
                                     .text_xs()
@@ -1295,60 +1419,149 @@ impl StermAdminApp {
                                     .font_family("Consolas")
                                     .text_color(t.text_muted)
                                     .truncate()
-                                    .child(format!(
-                                        "{}@{}:{}",
-                                        pane.username, pane.hostname, pane.port
-                                    )),
-                            ),
+                                    .child(if is_local {
+                                        "Local PTY".to_string()
+                                    } else {
+                                        format!("{}@{}:{}", pane.username, pane.hostname, pane.port)
+                                    }),
+                            )
+                            .when(broadcast_input, |el| {
+                                el.child(
+                                    div()
+                                        .px_1p5()
+                                        .py(px(1.0))
+                                        .rounded_sm()
+                                        .flex_shrink_0()
+                                        .bg(t.warning_soft)
+                                        .border_1()
+                                        .border_color(t.warning)
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .text_size(px(9.0))
+                                        .font_weight(FontWeight::BOLD)
+                                        .text_color(t.warning)
+                                        .child(icon_svg(Icon::Broadcast, 10.0, t.warning))
+                                        .child("BROADCAST"),
+                                )
+                            }),
                     )
-                    // Pane toolbar actions
+                    // Pane toolbar actions (crisp embedded Lucide SVG icons)
                     .child(
                         div()
                             .flex()
                             .items_center()
                             .gap_1()
                             .flex_shrink_0()
+                            // Command Suggestions
                             .child(
                                 div()
                                     .id(gpui::SharedString::from(format!("p-sug-{pid_str}")))
                                     .px_1p5()
                                     .py_0p5()
                                     .rounded_md()
-                                    .text_size(px(11.0))
-                                    .text_color(if is_active && self.suggestions_manual_open {
-                                        t.accent
-                                    } else {
-                                        t.text_muted
-                                    })
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
                                     .cursor_pointer()
-                                    .hover(|s| s.bg(t.bg_hover).text_color(t.text_primary))
+                                    .hover(|s| s.bg(t.bg_hover))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.suggestions_manual_open =
                                             !this.suggestions_manual_open;
                                         this.suggestions_dismissed = false;
                                         cx.notify();
                                     }))
-                                    .child("⚡"),
+                                    .child(icon_svg(
+                                        Icon::Zap,
+                                        13.0,
+                                        if is_active && self.suggestions_manual_open {
+                                            t.accent
+                                        } else {
+                                            t.text_muted
+                                        },
+                                    )),
                             )
+                            // In-Terminal Search
                             .child(
                                 div()
                                     .id(gpui::SharedString::from(format!("p-find-{pid_str}")))
                                     .px_1p5()
                                     .py_0p5()
                                     .rounded_md()
-                                    .text_size(px(11.0))
-                                    .text_color(if is_active && self.term_search_open {
-                                        t.accent
-                                    } else {
-                                        t.text_muted
-                                    })
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
                                     .cursor_pointer()
-                                    .hover(|s| s.bg(t.bg_hover).text_color(t.text_primary))
+                                    .hover(|s| s.bg(t.bg_hover))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.term_search_open = !this.term_search_open;
                                         cx.notify();
                                     }))
-                                    .child("⌕"),
+                                    .child(icon_svg(
+                                        Icon::Search,
+                                        13.0,
+                                        if is_active && self.term_search_open {
+                                            t.accent
+                                        } else {
+                                            t.text_muted
+                                        },
+                                    )),
+                            )
+                            // Broadcast Input Toggle (multiplex keystrokes across all split panes)
+                            .child(
+                                div()
+                                    .id(gpui::SharedString::from(format!("p-bcast-{pid_str}")))
+                                    .px_1p5()
+                                    .py_0p5()
+                                    .rounded_md()
+                                    .bg(if broadcast_input {
+                                        t.warning_soft
+                                    } else {
+                                        gpui::transparent_black()
+                                    })
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(t.bg_hover))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.toggle_broadcast_input(&ws_bcast, cx);
+                                    }))
+                                    .child(icon_svg(
+                                        Icon::Broadcast,
+                                        13.0,
+                                        if broadcast_input {
+                                            t.warning
+                                        } else {
+                                            t.text_muted
+                                        },
+                                    )),
+                            )
+                            // Session Transcript Recorder
+                            .child(
+                                div()
+                                    .id(gpui::SharedString::from(format!("p-log-{pid_str}")))
+                                    .px_1p5()
+                                    .py_0p5()
+                                    .rounded_md()
+                                    .bg(if is_recording {
+                                        t.danger_soft
+                                    } else {
+                                        gpui::transparent_black()
+                                    })
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(t.bg_hover))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.toggle_pane_transcript(pid_log.clone(), cx);
+                                    }))
+                                    .child(icon_svg(
+                                        Icon::Record,
+                                        13.0,
+                                        if is_recording { t.danger } else { t.text_muted },
+                                    )),
                             )
                             .when(has_selection, |el| {
                                 el.child(
@@ -1404,6 +1617,38 @@ impl StermAdminApp {
                                     }))
                                     .child("Clear"),
                             )
+                            // Docked SFTP Drawer toggle (for connected SSH panes)
+                            .when(!is_local && pane.connected, |el| {
+                                el.child(
+                                    div()
+                                        .id(gpui::SharedString::from(format!("p-drw-{pid_str}")))
+                                        .px_1p5()
+                                        .py_0p5()
+                                        .rounded_md()
+                                        .bg(if self.sftp_drawer_open {
+                                            t.accent_soft
+                                        } else {
+                                            gpui::transparent_black()
+                                        })
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(t.bg_hover))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.toggle_sftp_drawer(&pid_drawer, cx);
+                                        }))
+                                        .child(icon_svg(
+                                            Icon::Files,
+                                            13.0,
+                                            if self.sftp_drawer_open {
+                                                t.accent
+                                            } else {
+                                                t.text_muted
+                                            },
+                                        )),
+                                )
+                            })
                             .when_some(sid_sftp, |el, sid| {
                                 el.child(
                                     div()
@@ -1432,10 +1677,11 @@ impl StermAdminApp {
                                     .px_1p5()
                                     .py_0p5()
                                     .rounded_md()
-                                    .text_size(px(11.0))
-                                    .text_color(t.text_muted)
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
                                     .cursor_pointer()
-                                    .hover(|s| s.bg(t.bg_hover).text_color(t.text_primary))
+                                    .hover(|s| s.bg(t.bg_hover))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.split_pane_duplicate_or_host(
                                             ws_spl_h.clone(),
@@ -1445,7 +1691,7 @@ impl StermAdminApp {
                                             cx,
                                         );
                                     }))
-                                    .child("◫"),
+                                    .child(icon_svg(Icon::SplitH, 13.0, t.text_muted)),
                             )
                             // Split Down (Vertical)
                             .child(
@@ -1454,10 +1700,11 @@ impl StermAdminApp {
                                     .px_1p5()
                                     .py_0p5()
                                     .rounded_md()
-                                    .text_size(px(11.0))
-                                    .text_color(t.text_muted)
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
                                     .cursor_pointer()
-                                    .hover(|s| s.bg(t.bg_hover).text_color(t.text_primary))
+                                    .hover(|s| s.bg(t.bg_hover))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.split_pane_duplicate_or_host(
                                             ws_spl_v.clone(),
@@ -1467,9 +1714,9 @@ impl StermAdminApp {
                                             cx,
                                         );
                                     }))
-                                    .child("⬓"),
+                                    .child(icon_svg(Icon::SplitV, 13.0, t.text_muted)),
                             )
-                            // Split with different host picker
+                            // Split with different host or local shell picker
                             .child(
                                 div()
                                     .id(gpui::SharedString::from(format!("p-spp-{pid_str}")))
@@ -1492,8 +1739,8 @@ impl StermAdminApp {
                                     }))
                                     .child("+Split"),
                             )
-                            // Save Quick-Connect session to Vault
-                            .when(pane.host_id.is_none(), |el| {
+                            // Save Quick-Connect session to Vault (SSH only)
+                            .when(pane.host_id.is_none() && !is_local, |el| {
                                 el.child(
                                     div()
                                         .id(gpui::SharedString::from(format!("p-save-{pid_str}")))
@@ -1510,22 +1757,29 @@ impl StermAdminApp {
                                         .child("★ Save"),
                                 )
                             })
-                            // Reconnect
-                            .child(
-                                div()
-                                    .id(gpui::SharedString::from(format!("p-rec-{pid_str}")))
-                                    .px_1p5()
-                                    .py_0p5()
-                                    .rounded_md()
-                                    .text_size(px(11.0))
-                                    .text_color(t.text_muted)
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(t.bg_hover).text_color(t.text_primary))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.reconnect_terminal_pane(pid_reconn.clone(), None, cx);
-                                    }))
-                                    .child("↻"),
-                            )
+                            // Reconnect (SSH only)
+                            .when(!is_local, |el| {
+                                el.child(
+                                    div()
+                                        .id(gpui::SharedString::from(format!("p-rec-{pid_str}")))
+                                        .px_1p5()
+                                        .py_0p5()
+                                        .rounded_md()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(t.bg_hover))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.reconnect_terminal_pane(
+                                                pid_reconn.clone(),
+                                                None,
+                                                cx,
+                                            );
+                                        }))
+                                        .child(icon_svg(Icon::Refresh, 13.0, t.text_muted)),
+                                )
+                            })
                             // Close Pane
                             .child(
                                 div()
@@ -1533,10 +1787,11 @@ impl StermAdminApp {
                                     .px_1p5()
                                     .py_0p5()
                                     .rounded_md()
-                                    .text_size(px(10.0))
-                                    .text_color(t.text_muted)
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
                                     .cursor_pointer()
-                                    .hover(|s| s.bg(t.danger_soft).text_color(t.danger))
+                                    .hover(|s| s.bg(t.danger_soft))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.close_pane_in_workspace(
                                             ws_close.clone(),
@@ -1544,7 +1799,7 @@ impl StermAdminApp {
                                             cx,
                                         );
                                     }))
-                                    .child("✕"),
+                                    .child(icon_svg(Icon::Close, 13.0, t.text_muted)),
                             ),
                     ),
             )
@@ -1851,7 +2106,7 @@ impl StermAdminApp {
                         el.child(popover)
                     }),
             )
-            // Compact Pane Footer (Status, Scrollback Jump-to-Live, Hovered URL hint)
+            // Compact Pane Footer (Status, Transcript REC, Scrollback Jump-to-Live, Hovered URL hint)
             .child(
                 div()
                     .h(px(24.0))
@@ -1866,10 +2121,28 @@ impl StermAdminApp {
                     .text_size(px(10.0))
                     .font_family("Consolas")
                     .text_color(t.text_muted)
-                    .child(format!(
-                        "{} · {}×{}",
-                        pane.status_line, pane.cols, pane.rows
-                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(format!(
+                                "{} · {}×{}",
+                                pane.status_line, pane.cols, pane.rows
+                            ))
+                            .when(is_recording, |el| {
+                                el.child(
+                                    div()
+                                        .px_1p5()
+                                        .py(px(1.0))
+                                        .rounded_sm()
+                                        .bg(t.danger_soft)
+                                        .text_color(t.danger)
+                                        .font_weight(FontWeight::BOLD)
+                                        .child("● REC"),
+                                )
+                            }),
+                    )
                     .child(
                         div()
                             .flex()
@@ -1910,6 +2183,284 @@ impl StermAdminApp {
                     ),
             )
             .into_any_element()
+    }
+
+    /// Compact Terminal-docked SFTP File Drawer (drop OS files to upload, click dirs to browse).
+    fn render_sftp_drawer(&self, t: &ThemePalette, cx: &mut Context<Self>) -> impl IntoElement {
+        let visible_remote = self.sftp_state.visible_remote_indices();
+        let connected = self.sftp_state.session_id.is_some();
+        let host_lbl = self
+            .sftp_state
+            .host_label
+            .clone()
+            .unwrap_or_else(|| "Remote".to_string());
+
+        div()
+            .h(px(210.0))
+            .w_full()
+            .flex_shrink_0()
+            .rounded_xl()
+            .bg(t.bg_card)
+            .border_1()
+            .border_color(t.border_strong)
+            .shadow_sm()
+            .overflow_hidden()
+            .flex()
+            .flex_col()
+            .drag_over::<ExternalPaths>(|s, _, _, _| s.border_color(gpui::rgb(0x10B981)))
+            .on_drop(cx.listener(|this, ext: &ExternalPaths, _, cx| {
+                this.handle_external_drop_on_remote(ext, cx);
+            }))
+            .child(
+                div()
+                    .h(px(32.0))
+                    .px_3()
+                    .flex_shrink_0()
+                    .bg(t.bg_subtle)
+                    .border_b_1()
+                    .border_color(t.border)
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .min_w_0()
+                            .child(icon_svg(Icon::Files, 13.0, t.accent))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(t.text_primary)
+                                    .child(format!("SFTP · {host_lbl}")),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .font_family("Consolas")
+                                    .text_color(t.text_muted)
+                                    .truncate()
+                                    .child(self.sftp_state.remote_path.clone()),
+                            )
+                            .when(self.sftp_state.connecting || self.sftp_state.loading_remote, |el| {
+                                el.child(loading_dots("drawer-dots", t.accent))
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .flex_shrink_0()
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(t.text_muted)
+                                    .child("Drop files here to upload"),
+                            )
+                            .child(
+                                div()
+                                    .id("sftp-drawer-up")
+                                    .px_2()
+                                    .py_0p5()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(t.border)
+                                    .text_xs()
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(t.bg_hover))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.navigate_remote_up();
+                                        cx.notify();
+                                    }))
+                                    .child("↑"),
+                            )
+                            .child(
+                                div()
+                                    .id("sftp-drawer-ref")
+                                    .px_1p5()
+                                    .py_0p5()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(t.border)
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(t.bg_hover))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        let cur = this.sftp_state.remote_path.clone();
+                                        this.refresh_remote_dir(cur);
+                                        cx.notify();
+                                    }))
+                                    .child(icon_svg(Icon::Refresh, 12.0, t.text_muted)),
+                            )
+                            .child(
+                                div()
+                                    .id("sftp-drawer-full")
+                                    .px_2()
+                                    .py_0p5()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(t.border)
+                                    .text_size(px(10.0))
+                                    .text_color(t.text_secondary)
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(t.bg_hover).text_color(t.accent))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.navigate_to(AdminPage::Sftp, cx);
+                                    }))
+                                    .child("Full SFTP"),
+                            )
+                            .child(
+                                div()
+                                    .id("sftp-drawer-close")
+                                    .px_1p5()
+                                    .py_0p5()
+                                    .rounded_md()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(t.danger_soft))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.sftp_drawer_open = false;
+                                        cx.notify();
+                                    }))
+                                    .child(icon_svg(Icon::Close, 12.0, t.text_muted)),
+                            ),
+                    ),
+            )
+            .child(if !connected {
+                div()
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_xs()
+                    .text_color(t.text_muted)
+                    .child("Attaching SFTP subsystem...")
+                    .into_any_element()
+            } else {
+                div()
+                    .id("sftp-drawer-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .children(visible_remote.into_iter().enumerate().map(|(ix, real_ix)| {
+                        let entry = self.sftp_state.remote_entries[real_ix].clone();
+                        let is_dir = entry.is_dir;
+                        let p_nav = entry.path.clone();
+                        let p_dl = entry.path.clone();
+                        let n_dl = entry.name.clone();
+                        let p_ed = entry.path.clone();
+
+                        div()
+                            .id(("drw-row", ix))
+                            .h(px(28.0))
+                            .px_3()
+                            .border_b_1()
+                            .border_color(t.border)
+                            .hover(|s| s.bg(t.bg_subtle))
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if is_dir {
+                                    this.refresh_remote_dir(p_nav.clone());
+                                    cx.notify();
+                                }
+                            }))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .min_w_0()
+                                    .child(if is_dir { "📁" } else { "📄" })
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(t.text_primary)
+                                            .truncate()
+                                            .child(entry.name),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1p5()
+                                    .flex_shrink_0()
+                                    .child(
+                                        div()
+                                            .text_size(px(10.0))
+                                            .font_family("Consolas")
+                                            .text_color(t.text_muted)
+                                            .child(if is_dir {
+                                                "dir".to_string()
+                                            } else {
+                                                format_bytes(entry.size)
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .id(("drw-dl", ix))
+                                            .px_1p5()
+                                            .py(px(1.0))
+                                            .rounded_sm()
+                                            .bg(t.accent_soft)
+                                            .text_size(px(10.0))
+                                            .text_color(t.accent)
+                                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                                cx.stop_propagation();
+                                            })
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                if is_dir {
+                                                    this.download_remote_dir(
+                                                        p_dl.clone(),
+                                                        n_dl.clone(),
+                                                        cx,
+                                                    );
+                                                } else {
+                                                    this.download_remote_file_checked(
+                                                        p_dl.clone(),
+                                                        n_dl.clone(),
+                                                        cx,
+                                                    );
+                                                }
+                                            }))
+                                            .child("↓"),
+                                    )
+                                    .when(!is_dir, |el| {
+                                        el.child(
+                                            div()
+                                                .id(("drw-ed", ix))
+                                                .px_1p5()
+                                                .py(px(1.0))
+                                                .rounded_sm()
+                                                .text_size(px(10.0))
+                                                .text_color(t.text_muted)
+                                                .hover(|s| s.bg(t.bg_hover))
+                                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                                    cx.stop_propagation();
+                                                })
+                                                .on_click(cx.listener(move |this, _, _, _| {
+                                                    this.open_remote_text_editor(p_ed.clone());
+                                                }))
+                                                .child("Edit"),
+                                        )
+                                    }),
+                            )
+                    }))
+                    .into_any_element()
+            })
     }
 
     // =========================================================================
@@ -2117,6 +2668,28 @@ impl StermAdminApp {
                                             .child("↑"),
                                     )
                                     .child(div().flex_1().child(self.sftp_local_path_input.clone()))
+                                    .when(
+                                        connected && !self.sftp_state.selected_local_paths.is_empty(),
+                                        |el| {
+                                            let n = self.sftp_state.selected_local_paths.len();
+                                            el.child(
+                                                div()
+                                                    .id("sftp-loc-batch-up")
+                                                    .px_2()
+                                                    .py_0p5()
+                                                    .rounded_md()
+                                                    .bg(t.accent_solid)
+                                                    .text_color(gpui::white())
+                                                    .text_size(px(10.0))
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .cursor_pointer()
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.batch_upload_selected(cx);
+                                                    }))
+                                                    .child(format!("Upload ({n}) →")),
+                                            )
+                                        },
+                                    )
                                     .child(
                                         div()
                                             .id("sftp-loc-ref")
@@ -2147,11 +2720,16 @@ impl StermAdminApp {
                                                     let real_ix = visible_local[vis_ix];
                                                     let entry =
                                                         this.sftp_state.local_entries[real_ix].clone();
-                                                    let selected = this
+                                                    let checked = this
                                                         .sftp_state
-                                                        .selected_local
-                                                        .as_deref()
-                                                        == Some(entry.path.as_str());
+                                                        .selected_local_paths
+                                                        .contains(&entry.path);
+                                                    let selected = checked
+                                                        || this
+                                                            .sftp_state
+                                                            .selected_local
+                                                            .as_deref()
+                                                            == Some(entry.path.as_str());
                                                     let drag_payload = DraggedSftpFile {
                                                         side: SftpPaneSide::Local,
                                                         name: entry.name.clone(),
@@ -2160,6 +2738,7 @@ impl StermAdminApp {
                                                         is_dir: entry.is_dir,
                                                     };
                                                     let p_click = entry.path.clone();
+                                                    let p_chk = entry.path.clone();
                                                     let is_dir = entry.is_dir;
                                                     let p_up = entry.path.clone();
                                                     let n_up = entry.name.clone();
@@ -2212,6 +2791,51 @@ impl StermAdminApp {
                                                                 .items_center()
                                                                 .gap_2()
                                                                 .min_w_0()
+                                                                .child(
+                                                                    div()
+                                                                        .id(("loc-chk", vis_ix))
+                                                                        .w(px(14.0))
+                                                                        .h(px(14.0))
+                                                                        .rounded(px(3.0))
+                                                                        .flex_shrink_0()
+                                                                        .border_1()
+                                                                        .border_color(if checked {
+                                                                            t_local.accent_solid
+                                                                        } else {
+                                                                            t_local.border_strong
+                                                                        })
+                                                                        .bg(if checked {
+                                                                            t_local.accent_solid
+                                                                        } else {
+                                                                            gpui::transparent_black()
+                                                                        })
+                                                                        .text_color(gpui::white())
+                                                                        .text_size(px(9.0))
+                                                                        .flex()
+                                                                        .items_center()
+                                                                        .justify_center()
+                                                                        .on_mouse_down(
+                                                                            MouseButton::Left,
+                                                                            |_, _, cx| {
+                                                                                cx.stop_propagation();
+                                                                            },
+                                                                        )
+                                                                        .on_click(cx.listener(
+                                                                            move |this, _, _, cx| {
+                                                                                cx.stop_propagation();
+                                                                                this.sftp_state
+                                                                                    .toggle_local_select(
+                                                                                        p_chk.clone(),
+                                                                                    );
+                                                                                cx.notify();
+                                                                            },
+                                                                        ))
+                                                                        .child(if checked {
+                                                                            "✓"
+                                                                        } else {
+                                                                            ""
+                                                                        }),
+                                                                )
                                                                 .child(if entry.is_dir {
                                                                     "📁"
                                                                 } else {
@@ -2246,7 +2870,7 @@ impl StermAdminApp {
                                                                             format_bytes(entry.size)
                                                                         }),
                                                                 )
-                                                                .when(!entry.is_dir && connected, |el| {
+                                                                .when(connected, |el| {
                                                                     el.child(
                                                                         div()
                                                                             .id(("loc-up", vis_ix))
@@ -2265,11 +2889,19 @@ impl StermAdminApp {
                                                                             .on_click(cx.listener(
                                                                                 move |this, _, _, cx| {
                                                                                     cx.stop_propagation();
-                                                                                    this.upload_local_file(
-                                                                                        p_up.clone(),
-                                                                                        n_up.clone(),
-                                                                                        cx,
-                                                                                    );
+                                                                                    if is_dir {
+                                                                                        this.upload_local_dir(
+                                                                                            p_up.clone(),
+                                                                                            n_up.clone(),
+                                                                                            cx,
+                                                                                        );
+                                                                                    } else {
+                                                                                        this.upload_local_file_checked(
+                                                                                            p_up.clone(),
+                                                                                            n_up.clone(),
+                                                                                            cx,
+                                                                                        );
+                                                                                    }
                                                                                 },
                                                                             ))
                                                                             .child("→"),
@@ -2341,6 +2973,29 @@ impl StermAdminApp {
                                             .child("↑"),
                                     )
                                     .child(div().flex_1().child(self.sftp_remote_path_input.clone()))
+                                    .when(
+                                        connected
+                                            && !self.sftp_state.selected_remote_paths.is_empty(),
+                                        |el| {
+                                            let n = self.sftp_state.selected_remote_paths.len();
+                                            el.child(
+                                                div()
+                                                    .id("sftp-rem-batch-dl")
+                                                    .px_2()
+                                                    .py_0p5()
+                                                    .rounded_md()
+                                                    .bg(t.accent_solid)
+                                                    .text_color(gpui::white())
+                                                    .text_size(px(10.0))
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .cursor_pointer()
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.batch_download_selected(cx);
+                                                    }))
+                                                    .child(format!("← Download ({n})")),
+                                            )
+                                        },
+                                    )
                                     .child(
                                         div()
                                             .id("sftp-rem-ref")
@@ -2415,11 +3070,16 @@ impl StermAdminApp {
                                                         let entry = this.sftp_state.remote_entries
                                                             [real_ix]
                                                             .clone();
-                                                        let selected = this
+                                                        let checked = this
                                                             .sftp_state
-                                                            .selected_remote
-                                                            .as_deref()
-                                                            == Some(entry.path.as_str());
+                                                            .selected_remote_paths
+                                                            .contains(&entry.path);
+                                                        let selected = checked
+                                                            || this
+                                                                .sftp_state
+                                                                .selected_remote
+                                                                .as_deref()
+                                                                == Some(entry.path.as_str());
                                                         let drag_payload = DraggedSftpFile {
                                                             side: SftpPaneSide::Remote,
                                                             name: entry.name.clone(),
@@ -2428,6 +3088,7 @@ impl StermAdminApp {
                                                             is_dir: entry.is_dir,
                                                         };
                                                         let p_click = entry.path.clone();
+                                                        let p_chk = entry.path.clone();
                                                         let is_dir = entry.is_dir;
                                                         let p_dl = entry.path.clone();
                                                         let n_dl = entry.name.clone();
@@ -2488,6 +3149,51 @@ impl StermAdminApp {
                                                                     .items_center()
                                                                     .gap_2()
                                                                     .min_w_0()
+                                                                    .child(
+                                                                        div()
+                                                                            .id(("rem-chk", vis_ix))
+                                                                            .w(px(14.0))
+                                                                            .h(px(14.0))
+                                                                            .rounded(px(3.0))
+                                                                            .flex_shrink_0()
+                                                                            .border_1()
+                                                                            .border_color(if checked {
+                                                                                t_remote.accent_solid
+                                                                            } else {
+                                                                                t_remote.border_strong
+                                                                            })
+                                                                            .bg(if checked {
+                                                                                t_remote.accent_solid
+                                                                            } else {
+                                                                                gpui::transparent_black()
+                                                                            })
+                                                                            .text_color(gpui::white())
+                                                                            .text_size(px(9.0))
+                                                                            .flex()
+                                                                            .items_center()
+                                                                            .justify_center()
+                                                                            .on_mouse_down(
+                                                                                MouseButton::Left,
+                                                                                |_, _, cx| {
+                                                                                    cx.stop_propagation();
+                                                                                },
+                                                                            )
+                                                                            .on_click(cx.listener(
+                                                                                move |this, _, _, cx| {
+                                                                                    cx.stop_propagation();
+                                                                                    this.sftp_state
+                                                                                        .toggle_remote_select(
+                                                                                            p_chk.clone(),
+                                                                                        );
+                                                                                    cx.notify();
+                                                                                },
+                                                                            ))
+                                                                            .child(if checked {
+                                                                                "✓"
+                                                                            } else {
+                                                                                ""
+                                                                            }),
+                                                                    )
                                                                     .child(if entry.is_dir {
                                                                         "📁"
                                                                     } else {
@@ -2549,38 +3255,46 @@ impl StermAdminApp {
                                                                                 perms & 0o777
                                                                             )),
                                                                     )
-                                                                    .when(!entry.is_dir, |el| {
-                                                                        el.child(
-                                                                            div()
-                                                                                .id(("rem-dl", vis_ix))
-                                                                                .px_1p5()
-                                                                                .py_0p5()
-                                                                                .rounded_sm()
-                                                                                .bg(t_remote
-                                                                                    .accent_soft)
-                                                                                .text_size(px(10.0))
-                                                                                .text_color(
-                                                                                    t_remote.accent,
-                                                                                )
-                                                                                .on_mouse_down(
-                                                                                    MouseButton::Left,
-                                                                                    |_, _, cx| {
-                                                                                        cx.stop_propagation();
-                                                                                    },
-                                                                                )
-                                                                                .on_click(cx.listener(
-                                                                                    move |this, _, _, cx| {
-                                                                                        cx.stop_propagation();
-                                                                                        this.download_remote_file(
+                                                                    .child(
+                                                                        div()
+                                                                            .id(("rem-dl", vis_ix))
+                                                                            .px_1p5()
+                                                                            .py_0p5()
+                                                                            .rounded_sm()
+                                                                            .bg(t_remote
+                                                                                .accent_soft)
+                                                                            .text_size(px(10.0))
+                                                                            .text_color(
+                                                                                t_remote.accent,
+                                                                            )
+                                                                            .on_mouse_down(
+                                                                                MouseButton::Left,
+                                                                                |_, _, cx| {
+                                                                                    cx.stop_propagation();
+                                                                                },
+                                                                            )
+                                                                            .on_click(cx.listener(
+                                                                                move |this, _, _, cx| {
+                                                                                    cx.stop_propagation();
+                                                                                    if is_dir {
+                                                                                        this.download_remote_dir(
                                                                                             p_dl.clone(),
                                                                                             n_dl.clone(),
                                                                                             cx,
                                                                                         );
-                                                                                    },
-                                                                                ))
-                                                                                .child("←"),
-                                                                        )
-                                                                        .child(
+                                                                                    } else {
+                                                                                        this.download_remote_file_checked(
+                                                                                            p_dl.clone(),
+                                                                                            n_dl.clone(),
+                                                                                            cx,
+                                                                                        );
+                                                                                    }
+                                                                                },
+                                                                            ))
+                                                                            .child("←"),
+                                                                    )
+                                                                    .when(!entry.is_dir, |el| {
+                                                                        el.child(
                                                                             div()
                                                                                 .id(("rem-ed", vis_ix))
                                                                                 .px_1p5()
@@ -2762,13 +3476,30 @@ impl StermAdminApp {
                             .justify_between()
                             .child(
                                 div()
-                                    .text_xs()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(if self.editing_snippet_id.is_some() {
-                                        "Edit Pinned Snippet"
-                                    } else {
-                                        "New Reusable Command Snippet"
-                                    }),
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child(if self.editing_snippet_id.is_some() {
+                                                "Edit Pinned Snippet"
+                                            } else {
+                                                "New Reusable Command Snippet"
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .px_1p5()
+                                            .py(px(1.0))
+                                            .rounded_sm()
+                                            .bg(t.bg_subtle)
+                                            .text_size(px(10.0))
+                                            .font_family("Consolas")
+                                            .text_color(t.text_muted)
+                                            .child("Supports {{variable}} templates"),
+                                    ),
                             )
                             .child(div().w(px(240.0)).child(self.snippet_search.clone())),
                     )
@@ -3055,7 +3786,476 @@ impl StermAdminApp {
     }
 
     // =========================================================================
-    // 6. Keychain & Trusted Known Hosts Page (Ref Count, Copy PubKey, Edit, Confirm Delete)
+    // 5b. SSH Port Forwarding Tunnels Page (-L / -R / -D SOCKS5 + Live Stats)
+    // =========================================================================
+    pub fn render_tunnels_page(&self, t: &ThemePalette, cx: &mut Context<Self>) -> impl IntoElement {
+        let active_count = self.active_tunnels.len();
+        let total_count = self.snapshot.port_forwards.len();
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .gap_3()
+            // Top Header Card
+            .child(
+                div()
+                    .p_3p5()
+                    .rounded_xl()
+                    .bg(t.bg_card)
+                    .border_1()
+                    .border_color(t.border)
+                    .shadow_sm()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2p5()
+                            .child(
+                                div()
+                                    .w(px(34.0))
+                                    .h(px(34.0))
+                                    .rounded_lg()
+                                    .bg(t.accent_soft)
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(icon_svg(Icon::Network, 16.0, t.accent)),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_0p5()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(t.text_primary)
+                                                    .child("SSH Port Forwarding (-L / -R / -D SOCKS5)"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .px_2()
+                                                    .py(px(1.0))
+                                                    .rounded_full()
+                                                    .bg(if active_count > 0 {
+                                                        t.success_soft
+                                                    } else {
+                                                        t.bg_subtle
+                                                    })
+                                                    .text_size(px(10.0))
+                                                    .font_family("Consolas")
+                                                    .text_color(if active_count > 0 {
+                                                        t.success
+                                                    } else {
+                                                        t.text_muted
+                                                    })
+                                                    .child(format!(
+                                                        "{active_count}/{total_count} active"
+                                                    )),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(t.text_muted)
+                                            .child("Saved in your E2EE vault. Reuses active SSH sessions or opens lightweight transport-only tunnels."),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("tunnels-new-btn")
+                            .px_3p5()
+                            .py_1p5()
+                            .rounded_lg()
+                            .bg(t.accent_solid)
+                            .text_color(gpui::white())
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .cursor_pointer()
+                            .hover(|s| s.opacity(0.92))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.open_tunnel_editor(None, cx);
+                            }))
+                            .child("+ New Tunnel"),
+                    ),
+            )
+            // Tunnels List Card
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .rounded_xl()
+                    .bg(t.bg_card)
+                    .border_1()
+                    .border_color(t.border)
+                    .shadow_sm()
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .px_4()
+                            .py_2()
+                            .bg(t.bg_subtle)
+                            .border_b_1()
+                            .border_color(t.border)
+                            .grid()
+                            .grid_cols(12)
+                            .gap_2()
+                            .text_size(px(11.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(t.text_muted)
+                            .child(div().col_span(3).child("TUNNEL & HOST"))
+                            .child(div().col_span(4).child("ROUTE"))
+                            .child(div().col_span(2).child("STATUS & TRAFFIC"))
+                            .child(div().col_span(3).text_right().child("ACTIONS")),
+                    )
+                    .child(
+                        div()
+                            .id("tunnels-table-scroll")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .when(self.snapshot.port_forwards.is_empty(), |el| {
+                                el.child(
+                                    div()
+                                        .py_12()
+                                        .flex()
+                                        .flex_col()
+                                        .items_center()
+                                        .gap_2p5()
+                                        .child(icon_svg(Icon::Network, 26.0, t.text_muted))
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(t.text_secondary)
+                                                .child("No port forwarding tunnels configured yet"),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(t.text_muted)
+                                                .child("Create a Local (-L), Remote (-R), or Dynamic SOCKS5 (-D) tunnel over any vault host."),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("tunnels-empty-add")
+                                                .mt_1()
+                                                .px_3p5()
+                                                .py_1p5()
+                                                .rounded_lg()
+                                                .bg(t.accent_solid)
+                                                .text_color(gpui::white())
+                                                .text_xs()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .cursor_pointer()
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.open_tunnel_editor(None, cx);
+                                                }))
+                                                .child("+ Create First Tunnel"),
+                                        ),
+                                )
+                            })
+                            .children(self.snapshot.port_forwards.iter().enumerate().map(
+                                |(ix, pf)| {
+                                    let stats = self.active_tunnels.get(&pf.id).cloned();
+                                    let is_active = stats.is_some();
+                                    let host_label = self
+                                        .snapshot
+                                        .hosts
+                                        .iter()
+                                        .find(|h| h.id == pf.host_id)
+                                        .map(|h| h.label.clone())
+                                        .unwrap_or_else(|| "Unknown Host".to_string());
+
+                                    let (kind_tag, kind_col, kind_bg) = match pf.kind {
+                                        PortForwardKind::Local => ("-L LOCAL", t.accent, t.accent_soft),
+                                        PortForwardKind::Remote => {
+                                            ("-R REMOTE", t.warning, t.warning_soft)
+                                        }
+                                        PortForwardKind::DynamicSocks5 => {
+                                            ("-D SOCKS5", t.success, t.success_soft)
+                                        }
+                                    };
+
+                                    let route_str = match pf.kind {
+                                        PortForwardKind::Local => format!(
+                                            "{}:{}  →  {}:{}",
+                                            pf.bind_address,
+                                            pf.bind_port,
+                                            pf.target_host.as_deref().unwrap_or("127.0.0.1"),
+                                            pf.target_port.unwrap_or(0)
+                                        ),
+                                        PortForwardKind::Remote => format!(
+                                            "remote {}:{}  →  local {}:{}",
+                                            pf.bind_address,
+                                            pf.bind_port,
+                                            pf.target_host.as_deref().unwrap_or("127.0.0.1"),
+                                            pf.target_port.unwrap_or(0)
+                                        ),
+                                        PortForwardKind::DynamicSocks5 => {
+                                            format!("SOCKS5  {}:{}", pf.bind_address, pf.bind_port)
+                                        }
+                                    };
+
+                                    let pf_start = pf.clone();
+                                    let pf_edit = pf.clone();
+                                    let tid_stop = pf.id.clone();
+                                    let lbl_stop = pf.label.clone();
+                                    let tid_del = pf.id.clone();
+                                    let lbl_del = pf.label.clone();
+
+                                    div()
+                                        .id(("tun-row", ix))
+                                        .px_4()
+                                        .py_3()
+                                        .border_b_1()
+                                        .border_color(t.border)
+                                        .hover(|s| s.bg(t.bg_subtle))
+                                        .grid()
+                                        .grid_cols(12)
+                                        .gap_2()
+                                        .items_center()
+                                        // Col 1: Status dot + Label + Host
+                                        .child(
+                                            div()
+                                                .col_span(3)
+                                                .flex()
+                                                .items_center()
+                                                .gap_2()
+                                                .min_w_0()
+                                                .child(
+                                                    div()
+                                                        .w(px(7.0))
+                                                        .h(px(7.0))
+                                                        .rounded_full()
+                                                        .flex_shrink_0()
+                                                        .bg(if is_active {
+                                                            t.success
+                                                        } else {
+                                                            t.border_strong
+                                                        }),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex()
+                                                        .flex_col()
+                                                        .min_w_0()
+                                                        .child(
+                                                            div()
+                                                                .text_xs()
+                                                                .font_weight(FontWeight::SEMIBOLD)
+                                                                .text_color(t.text_primary)
+                                                                .truncate()
+                                                                .child(pf.label.clone()),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .text_size(px(10.0))
+                                                                .text_color(t.text_muted)
+                                                                .truncate()
+                                                                .child(format!("via {host_label}")),
+                                                        ),
+                                                ),
+                                        )
+                                        // Col 2: Kind badge + Route
+                                        .child(
+                                            div()
+                                                .col_span(4)
+                                                .flex()
+                                                .items_center()
+                                                .gap_2()
+                                                .min_w_0()
+                                                .child(
+                                                    div()
+                                                        .px_1p5()
+                                                        .py(px(1.0))
+                                                        .rounded_sm()
+                                                        .flex_shrink_0()
+                                                        .bg(kind_bg)
+                                                        .text_size(px(9.0))
+                                                        .font_family("Consolas")
+                                                        .font_weight(FontWeight::BOLD)
+                                                        .text_color(kind_col)
+                                                        .child(kind_tag),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .font_family("Consolas")
+                                                        .text_color(t.text_secondary)
+                                                        .truncate()
+                                                        .child(route_str),
+                                                ),
+                                        )
+                                        // Col 3: Live Traffic Stats
+                                        .child(
+                                            div()
+                                                .col_span(2)
+                                                .flex()
+                                                .flex_col()
+                                                .min_w_0()
+                                                .child(if let Some(st) = stats {
+                                                    div()
+                                                        .flex()
+                                                        .flex_col()
+                                                        .child(
+                                                            div()
+                                                                .text_size(px(10.0))
+                                                                .font_weight(FontWeight::SEMIBOLD)
+                                                                .text_color(t.success)
+                                                                .child(format!(
+                                                                    "Active · {} conn",
+                                                                    st.active_connections
+                                                                )),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .text_size(px(10.0))
+                                                                .font_family("Consolas")
+                                                                .text_color(t.text_muted)
+                                                                .child(format!(
+                                                                    "↑{}  ↓{}",
+                                                                    format_bytes(st.bytes_tx),
+                                                                    format_bytes(st.bytes_rx)
+                                                                )),
+                                                        )
+                                                        .into_any_element()
+                                                } else {
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(t.text_muted)
+                                                        .child("Stopped")
+                                                        .into_any_element()
+                                                }),
+                                        )
+                                        // Col 4: Start/Stop, Edit, Delete
+                                        .child(
+                                            div()
+                                                .col_span(3)
+                                                .flex()
+                                                .items_center()
+                                                .justify_end()
+                                                .gap_1p5()
+                                                .child(if is_active {
+                                                    div()
+                                                        .id(("tun-stop", ix))
+                                                        .px_2p5()
+                                                        .py_1()
+                                                        .rounded_md()
+                                                        .bg(t.danger_soft)
+                                                        .border_1()
+                                                        .border_color(t.danger)
+                                                        .text_color(t.danger)
+                                                        .text_size(px(11.0))
+                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                        .cursor_pointer()
+                                                        .on_click(cx.listener(
+                                                            move |this, _, _, cx| {
+                                                                this.stop_port_forward(
+                                                                    tid_stop.clone(),
+                                                                    lbl_stop.clone(),
+                                                                    cx,
+                                                                );
+                                                            },
+                                                        ))
+                                                        .child("■ Stop")
+                                                        .into_any_element()
+                                                } else {
+                                                    div()
+                                                        .id(("tun-start", ix))
+                                                        .px_2p5()
+                                                        .py_1()
+                                                        .rounded_md()
+                                                        .bg(t.accent_solid)
+                                                        .text_color(gpui::white())
+                                                        .text_size(px(11.0))
+                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                        .cursor_pointer()
+                                                        .hover(|s| s.opacity(0.92))
+                                                        .on_click(cx.listener(
+                                                            move |this, _, _, cx| {
+                                                                this.start_port_forward(
+                                                                    pf_start.clone(),
+                                                                    cx,
+                                                                );
+                                                            },
+                                                        ))
+                                                        .child("▶ Start")
+                                                        .into_any_element()
+                                                })
+                                                .child(
+                                                    div()
+                                                        .id(("tun-edit", ix))
+                                                        .px_2()
+                                                        .py_1()
+                                                        .rounded_md()
+                                                        .border_1()
+                                                        .border_color(t.border)
+                                                        .text_size(px(11.0))
+                                                        .text_color(t.text_muted)
+                                                        .cursor_pointer()
+                                                        .hover(|s| {
+                                                            s.bg(t.bg_hover)
+                                                                .text_color(t.text_primary)
+                                                        })
+                                                        .on_click(cx.listener(
+                                                            move |this, _, _, cx| {
+                                                                this.open_tunnel_editor(
+                                                                    Some(&pf_edit),
+                                                                    cx,
+                                                                );
+                                                            },
+                                                        ))
+                                                        .child("Edit"),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .id(("tun-del", ix))
+                                                        .px_1p5()
+                                                        .py_1()
+                                                        .rounded_md()
+                                                        .text_size(px(11.0))
+                                                        .text_color(t.text_muted)
+                                                        .cursor_pointer()
+                                                        .hover(|s| {
+                                                            s.bg(t.danger_soft).text_color(t.danger)
+                                                        })
+                                                        .on_click(cx.listener(
+                                                            move |this, _, _, cx| {
+                                                                this.request_confirm(
+                                                                    ConfirmAction::DeleteTunnel {
+                                                                        id: tid_del.clone(),
+                                                                        label: lbl_del.clone(),
+                                                                    },
+                                                                    cx,
+                                                                );
+                                                            },
+                                                        ))
+                                                        .child("✕"),
+                                                ),
+                                        )
+                                },
+                            )),
+                    ),
+            )
+    }
+
+    // =========================================================================
+    // 6. Keychain & Trusted Known Hosts Page (Ref Count, Copy PubKey, Deploy, Edit, Confirm Delete)
     // =========================================================================
     pub fn render_keychain_page(&self, t: &ThemePalette, cx: &mut Context<Self>) -> impl IntoElement {
         div()
@@ -3244,7 +4444,34 @@ impl StermAdminApp {
                                             .gap_1()
                                             .flex_shrink_0()
                                             .when_some(pubkey, |el, pk| {
+                                                let pk_deploy = pk.clone();
+                                                let lbl_deploy = c.label.clone();
                                                 el.child(
+                                                    div()
+                                                        .id(("kc-deploy-pk", ix))
+                                                        .px_2()
+                                                        .py_1()
+                                                        .rounded_md()
+                                                        .bg(t.accent_soft)
+                                                        .border_1()
+                                                        .border_color(t.accent)
+                                                        .text_size(px(10.0))
+                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                        .text_color(t.accent)
+                                                        .cursor_pointer()
+                                                        .hover(|s| s.opacity(0.9))
+                                                        .on_click(cx.listener(
+                                                            move |this, _, _, cx| {
+                                                                this.open_deploy_key_modal(
+                                                                    lbl_deploy.clone(),
+                                                                    pk_deploy.clone(),
+                                                                    cx,
+                                                                );
+                                                            },
+                                                        ))
+                                                        .child("Deploy Key"),
+                                                )
+                                                .child(
                                                     div()
                                                         .id(("kc-cp-pk", ix))
                                                         .px_2()

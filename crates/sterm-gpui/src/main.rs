@@ -1,6 +1,8 @@
 mod app;
 mod backend;
 mod command_suggestions;
+mod icons;
+mod local_shell;
 mod modals;
 mod motion;
 mod settings_view;
@@ -17,6 +19,7 @@ use gpui::{
 
 use crate::app::StermAdminApp;
 use crate::backend::BackendServices;
+use crate::icons::StermAssets;
 
 fn main() {
     tracing_subscriber::fmt()
@@ -28,7 +31,7 @@ fn main() {
 
     let (services, ui_rx) = BackendServices::init();
 
-    Application::new().run(move |cx: &mut App| {
+    Application::new().with_assets(StermAssets).run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1320.0), px(840.0)), cx);
         let services_clone = services.clone();
 

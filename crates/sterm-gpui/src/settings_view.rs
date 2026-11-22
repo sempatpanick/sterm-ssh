@@ -5,6 +5,7 @@ use gpui::{
 };
 
 use crate::app::{ConfirmAction, SettingsTab, StermAdminApp};
+use crate::icons::{icon_svg, Icon};
 use crate::motion::loading_dots;
 use crate::theme::{
     AccentPreset, TerminalCursorStyle, TerminalThemeId, ThemeMode, ThemePalette,
@@ -14,11 +15,11 @@ impl StermAdminApp {
     /// Unified 4-tab Admin Settings:
     /// Appearance & GUI, Terminal & SSH, Account & Sync, and Vault & Backup.
     pub fn render_settings_page(&self, t: &ThemePalette, cx: &mut Context<Self>) -> impl IntoElement {
-        let tabs: [(SettingsTab, &str, &str); 4] = [
-            (SettingsTab::Appearance, "◐", "Appearance & GUI"),
-            (SettingsTab::Terminal, ">_", "Terminal & SSH"),
-            (SettingsTab::Account, "☁", "Account & Sync"),
-            (SettingsTab::Security, "⚿", "Vault & Backup"),
+        let tabs: [(SettingsTab, Icon, &str); 4] = [
+            (SettingsTab::Appearance, Icon::Settings, "Appearance & GUI"),
+            (SettingsTab::Terminal, Icon::Terminal, "Terminal & SSH"),
+            (SettingsTab::Account, Icon::Network, "Account & Sync"),
+            (SettingsTab::Security, Icon::Shield, "Vault & Backup"),
         ];
 
         let tab_body = match self.settings_tab {
@@ -99,7 +100,11 @@ impl StermAdminApp {
                                             cx.notify();
                                         }
                                     }))
-                                    .child(div().font_family("Consolas").child(icon))
+                                    .child(icon_svg(
+                                        icon,
+                                        13.0,
+                                        if active { t.accent } else { t.text_muted },
+                                    ))
                                     .child(label)
                             })),
                     )
@@ -693,7 +698,19 @@ impl StermAdminApp {
                                         }),
                                     )),
                             ),
-                    ),
+                    )
+                    // Auto-Reconnect Toggle (Phase 3)
+                    .child(self.settings_toggle_row(
+                        t,
+                        "set-autoreconnect-toggle",
+                        "Auto-Reconnect SSH Sessions",
+                        "Automatically retry dropped SSH connections with exponential backoff (up to 5 attempts)",
+                        self.settings.auto_reconnect,
+                        cx.listener(|this, _, _, cx| {
+                            this.settings.auto_reconnect = !this.settings.auto_reconnect;
+                            this.save_settings(cx);
+                        }),
+                    )),
             )
             // Right Card: Live Terminal Preview
             .child(
@@ -1290,7 +1307,84 @@ impl StermAdminApp {
                                 div()
                                     .text_sm()
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .child("Local Vault Diagnostics"),
+                                    .child("Vault Auto-Lock & Diagnostics"),
+                            )
+                            // Auto-Lock Idle Timer Selector (Phase 3)
+                            .child(
+                                div()
+                                    .p_3()
+                                    .rounded_xl()
+                                    .bg(t.bg_subtle)
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1p5()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(t.text_primary)
+                                            .child("Auto-Lock Vault After Inactivity"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(11.0))
+                                            .text_color(t.text_muted)
+                                            .child("Locks the decrypted vault key in memory when idle."),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_wrap()
+                                            .gap_1p5()
+                                            .pt_0p5()
+                                            .children(
+                                                [
+                                                    (0u32, "Off"),
+                                                    (5, "5m"),
+                                                    (15, "15m"),
+                                                    (30, "30m"),
+                                                    (60, "60m"),
+                                                ]
+                                                .into_iter()
+                                                .enumerate()
+                                                .map(|(ix, (mins, lbl))| {
+                                                    let active =
+                                                        self.settings.auto_lock_minutes == mins;
+                                                    div()
+                                                        .id(("set-autolock", ix))
+                                                        .px_2p5()
+                                                        .py_1()
+                                                        .rounded_md()
+                                                        .border_1()
+                                                        .text_xs()
+                                                        .font_family("Consolas")
+                                                        .cursor_pointer()
+                                                        .bg(if active {
+                                                            t.accent_soft
+                                                        } else {
+                                                            t.bg_card
+                                                        })
+                                                        .border_color(if active {
+                                                            t.accent
+                                                        } else {
+                                                            t.border
+                                                        })
+                                                        .text_color(if active {
+                                                            t.accent
+                                                        } else {
+                                                            t.text_primary
+                                                        })
+                                                        .on_click(cx.listener(
+                                                            move |this, _, _, cx| {
+                                                                this.settings.auto_lock_minutes =
+                                                                    mins;
+                                                                this.save_settings(cx);
+                                                            },
+                                                        ))
+                                                        .child(lbl)
+                                                }),
+                                            ),
+                                    ),
                             )
                             .child(
                                 div()
@@ -1311,6 +1405,11 @@ impl StermAdminApp {
                                     ))
                                     .child(format!("Hosts: {}", self.snapshot.hosts.len()))
                                     .child(format!("Groups: {}", self.snapshot.groups.len()))
+                                    .child(format!(
+                                        "Port Forward Tunnels: {} ({} active)",
+                                        self.snapshot.port_forwards.len(),
+                                        self.active_tunnels.len()
+                                    ))
                                     .child(format!(
                                         "Credentials & Keys: {}",
                                         self.snapshot.credentials.len()
