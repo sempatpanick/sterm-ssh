@@ -1,5 +1,6 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::time::Instant;
 
 use core_sftp::types::{FileEntry, TransferDirection, TransferProgress, TransferStatus};
 use gpui::{
@@ -94,6 +95,10 @@ pub struct SftpWorkspaceState {
     pub session_id: Option<String>,
     pub host_id: Option<String>,
     pub host_label: Option<String>,
+    /// Optional left-pane remote SFTP session for Any-to-Any (Remote ↔ Remote) transfers.
+    pub left_remote_session_id: Option<String>,
+    pub left_remote_host_id: Option<String>,
+    pub left_remote_host_label: Option<String>,
     pub local_path: String,
     pub remote_path: String,
     pub local_entries: Vec<FileEntry>,
@@ -109,6 +114,7 @@ pub struct SftpWorkspaceState {
     pub loading_local: bool,
     pub loading_remote: bool,
     pub transfers: Vec<TransferProgress>,
+    pub transfer_started_at: HashMap<String, Instant>,
 }
 
 impl SftpWorkspaceState {
@@ -117,6 +123,9 @@ impl SftpWorkspaceState {
             session_id: None,
             host_id: None,
             host_label: None,
+            left_remote_session_id: None,
+            left_remote_host_id: None,
+            left_remote_host_label: None,
             local_path: default_local,
             remote_path: "/".to_string(),
             local_entries: Vec::new(),
@@ -132,7 +141,12 @@ impl SftpWorkspaceState {
             loading_local: false,
             loading_remote: false,
             transfers: Vec::new(),
+            transfer_started_at: HashMap::new(),
         }
+    }
+
+    pub fn is_left_remote(&self) -> bool {
+        self.left_remote_session_id.is_some()
     }
 
     pub fn visible_local_indices(&self) -> Vec<usize> {
@@ -187,6 +201,9 @@ impl SftpWorkspaceState {
     }
 
     pub fn upsert_transfer(&mut self, progress: TransferProgress) {
+        self.transfer_started_at
+            .entry(progress.transfer_id.clone())
+            .or_insert_with(Instant::now);
         if let Some(existing) = self
             .transfers
             .iter_mut()
@@ -198,6 +215,34 @@ impl SftpWorkspaceState {
             if self.transfers.len() > 25 {
                 self.transfers.truncate(25);
             }
+        }
+    }
+
+    /// Formats live transfer throughput and estimated time remaining (e.g. `4.2 MB/s · ~8s`).
+    pub fn transfer_speed_eta(&self, tr: &TransferProgress) -> Option<String> {
+        if !matches!(tr.status, TransferStatus::Running) || tr.bytes_transferred == 0 {
+            return None;
+        }
+        let started = self.transfer_started_at.get(&tr.transfer_id)?;
+        let elapsed = started.elapsed().as_secs_f64();
+        if elapsed < 0.05 {
+            return None;
+        }
+        let bps = (tr.bytes_transferred as f64 / elapsed) as u64;
+        if bps == 0 {
+            return None;
+        }
+        let speed = format!("{}/s", format_bytes(bps));
+        if tr.total_bytes > tr.bytes_transferred {
+            let rem_secs = ((tr.total_bytes - tr.bytes_transferred) as f64 / bps as f64).ceil() as u64;
+            let eta = if rem_secs >= 60 {
+                format!("~{}m{}s", rem_secs / 60, rem_secs % 60)
+            } else {
+                format!("~{rem_secs}s")
+            };
+            Some(format!("{speed} · {eta}"))
+        } else {
+            Some(speed)
         }
     }
 

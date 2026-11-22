@@ -29,8 +29,9 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::types::{
-    ConnectRequest, HostKeyChallenge, HostKeyStatus, KeyboardInteractiveChallenge,
-    KeyboardInteractivePrompt, SshAuthMethod, SshTarget, TerminalEvent, TunnelKind, TunnelStats,
+    AgentIdentityInfo, ConnectRequest, HostKeyChallenge, HostKeyStatus,
+    KeyboardInteractiveChallenge, KeyboardInteractivePrompt, SshAuthMethod, SshTarget,
+    TerminalEvent, TunnelKind, TunnelStats,
 };
 use crate::{SshError, SshResult};
 
@@ -102,6 +103,7 @@ struct StermClientHandler {
     verifier: Arc<dyn HostKeyVerifier>,
     disconnect_reason: Arc<Mutex<Option<String>>>,
     remote_forwards: RemoteForwardMap,
+    forward_agent: bool,
 }
 
 impl client::Handler for StermClientHandler {
@@ -201,6 +203,55 @@ impl client::Handler for StermClientHandler {
                 .counters
                 .active_connections
                 .fetch_sub(1, Ordering::Relaxed);
+        });
+        Ok(())
+    }
+
+    async fn server_channel_open_agent_forward(
+        &mut self,
+        channel: Channel<Msg>,
+        reply: ChannelOpenHandle,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        if !self.forward_agent {
+            reply
+                .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            return Ok(());
+        }
+        reply.accept().await;
+        tokio::spawn(async move {
+            let mut ssh_stream = channel.into_stream();
+            #[cfg(unix)]
+            {
+                let Ok(sock_path) = std::env::var("SSH_AUTH_SOCK") else {
+                    warn!("Agent forwarding channel opened, but SSH_AUTH_SOCK is unset");
+                    return;
+                };
+                match tokio::net::UnixStream::connect(&sock_path).await {
+                    Ok(mut agent) => {
+                        let _ = tokio::io::copy_bidirectional(&mut ssh_stream, &mut agent).await;
+                    }
+                    Err(e) => warn!("Agent forwarding failed to connect to {sock_path}: {e}"),
+                }
+            }
+            #[cfg(windows)]
+            {
+                match tokio::net::windows::named_pipe::ClientOptions::new()
+                    .open(r"\\.\pipe\openssh-ssh-agent")
+                {
+                    Ok(mut pipe) => {
+                        let _ = tokio::io::copy_bidirectional(&mut ssh_stream, &mut pipe).await;
+                    }
+                    Err(e) => {
+                        warn!("Agent forwarding failed to open Windows OpenSSH agent pipe: {e}")
+                    }
+                }
+            }
+            #[cfg(not(any(unix, windows)))]
+            {
+                let _ = &mut ssh_stream;
+            }
         });
         Ok(())
     }
@@ -337,6 +388,250 @@ impl SshSessionManager {
         Ok(stream)
     }
 
+    /// Connects directly to `target_host:target_port`, or tunnels via an HTTP CONNECT or SOCKS5
+    /// proxy when `proxy_url` (`socks5://[user:pass@]host:port` or `http://[user:pass@]host:port`) is set.
+    pub async fn dial_tcp_or_proxy(
+        target_host: &str,
+        target_port: u16,
+        proxy_url: Option<&str>,
+    ) -> SshResult<tokio::net::TcpStream> {
+        let Some(raw) = proxy_url.map(str::trim).filter(|s| !s.is_empty()) else {
+            return Self::connect_tcp_with_keepalive(&format!("{target_host}:{target_port}")).await;
+        };
+
+        let parsed = parse_proxy_url(raw)?;
+        let proxy_addr = format!("{}:{}", parsed.host, parsed.port);
+        let mut stream = Self::connect_tcp_with_keepalive(&proxy_addr).await?;
+
+        match parsed.scheme {
+            ProxyScheme::Http => {
+                let mut req = format!(
+                    "CONNECT {target_host}:{target_port} HTTP/1.1\r\nHost: {target_host}:{target_port}\r\nProxy-Connection: Keep-Alive\r\n"
+                );
+                if let Some((ref u, ref p)) = parsed.auth {
+                    let cred = B64.encode(format!("{u}:{p}"));
+                    req.push_str(&format!("Proxy-Authorization: Basic {cred}\r\n"));
+                }
+                req.push_str("\r\n");
+                stream
+                    .write_all(req.as_bytes())
+                    .await
+                    .map_err(|e| SshError::Connect(format!("HTTP proxy write failed: {e}")))?;
+
+                let mut resp = Vec::with_capacity(256);
+                let mut byte = [0u8; 1];
+                while resp.len() < 8192 {
+                    stream
+                        .read_exact(&mut byte)
+                        .await
+                        .map_err(|e| SshError::Connect(format!("HTTP proxy read failed: {e}")))?;
+                    resp.push(byte[0]);
+                    if resp.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let header = String::from_utf8_lossy(&resp);
+                let status_line = header.lines().next().unwrap_or("");
+                if !status_line.contains(" 200") {
+                    return Err(SshError::Connect(format!(
+                        "HTTP proxy rejected CONNECT: {status_line}"
+                    )));
+                }
+                Ok(stream)
+            }
+            ProxyScheme::Socks5 => {
+                let methods: &[u8] = if parsed.auth.is_some() {
+                    &[0x05, 0x02, 0x00, 0x02]
+                } else {
+                    &[0x05, 0x01, 0x00]
+                };
+                stream
+                    .write_all(methods)
+                    .await
+                    .map_err(|e| SshError::Connect(format!("SOCKS5 greeting failed: {e}")))?;
+                let mut choice = [0u8; 2];
+                stream
+                    .read_exact(&mut choice)
+                    .await
+                    .map_err(|e| SshError::Connect(format!("SOCKS5 greeting reply failed: {e}")))?;
+                if choice[0] != 0x05 {
+                    return Err(SshError::Connect("invalid SOCKS5 server version".into()));
+                }
+                match choice[1] {
+                    0x00 => {}
+                    0x02 => {
+                        let (u, p) = parsed.auth.ok_or_else(|| {
+                            SshError::Connect("SOCKS5 proxy requires username/password".into())
+                        })?;
+                        let mut auth_buf = Vec::with_capacity(3 + u.len() + p.len());
+                        auth_buf.push(0x01);
+                        auth_buf.push(u.len().min(255) as u8);
+                        auth_buf.extend_from_slice(&u.as_bytes()[..u.len().min(255)]);
+                        auth_buf.push(p.len().min(255) as u8);
+                        auth_buf.extend_from_slice(&p.as_bytes()[..p.len().min(255)]);
+                        stream.write_all(&auth_buf).await.map_err(|e| {
+                            SshError::Connect(format!("SOCKS5 auth write failed: {e}"))
+                        })?;
+                        let mut auth_rep = [0u8; 2];
+                        stream.read_exact(&mut auth_rep).await.map_err(|e| {
+                            SshError::Connect(format!("SOCKS5 auth reply failed: {e}"))
+                        })?;
+                        if auth_rep[1] != 0x00 {
+                            return Err(SshError::Connect(
+                                "SOCKS5 proxy authentication rejected".into(),
+                            ));
+                        }
+                    }
+                    _ => {
+                        return Err(SshError::Connect(format!(
+                            "SOCKS5 proxy refused auth methods (code 0x{:02x})",
+                            choice[1]
+                        )));
+                    }
+                }
+
+                // SOCKS5 CONNECT request
+                let mut req = vec![0x05, 0x01, 0x00];
+                if let Ok(ip4) = target_host.parse::<Ipv4Addr>() {
+                    req.push(0x01);
+                    req.extend_from_slice(&ip4.octets());
+                } else if let Ok(ip6) = target_host.parse::<Ipv6Addr>() {
+                    req.push(0x04);
+                    req.extend_from_slice(&ip6.octets());
+                } else {
+                    let host_bytes = target_host.as_bytes();
+                    if host_bytes.len() > 255 {
+                        return Err(SshError::Connect("target hostname too long for SOCKS5".into()));
+                    }
+                    req.push(0x03);
+                    req.push(host_bytes.len() as u8);
+                    req.extend_from_slice(host_bytes);
+                }
+                req.extend_from_slice(&target_port.to_be_bytes());
+                stream
+                    .write_all(&req)
+                    .await
+                    .map_err(|e| SshError::Connect(format!("SOCKS5 CONNECT failed: {e}")))?;
+
+                let mut head = [0u8; 4];
+                stream
+                    .read_exact(&mut head)
+                    .await
+                    .map_err(|e| SshError::Connect(format!("SOCKS5 reply failed: {e}")))?;
+                if head[0] != 0x05 || head[1] != 0x00 {
+                    return Err(SshError::Connect(format!(
+                        "SOCKS5 CONNECT rejected (status 0x{:02x})",
+                        head[1]
+                    )));
+                }
+                match head[3] {
+                    0x01 => {
+                        let mut skip = [0u8; 6];
+                        stream.read_exact(&mut skip).await.map_err(|e| {
+                            SshError::Connect(format!("SOCKS5 reply body failed: {e}"))
+                        })?;
+                    }
+                    0x03 => {
+                        let mut len = [0u8; 1];
+                        stream.read_exact(&mut len).await.map_err(|e| {
+                            SshError::Connect(format!("SOCKS5 reply body failed: {e}"))
+                        })?;
+                        let mut skip = vec![0u8; len[0] as usize + 2];
+                        stream.read_exact(&mut skip).await.map_err(|e| {
+                            SshError::Connect(format!("SOCKS5 reply body failed: {e}"))
+                        })?;
+                    }
+                    0x04 => {
+                        let mut skip = [0u8; 18];
+                        stream.read_exact(&mut skip).await.map_err(|e| {
+                            SshError::Connect(format!("SOCKS5 reply body failed: {e}"))
+                        })?;
+                    }
+                    _ => {}
+                }
+                Ok(stream)
+            }
+        }
+    }
+
+    /// Probes TCP reachability and returns round-trip connection latency in milliseconds.
+    pub async fn probe_tcp_latency(hostname: &str, port: u16, timeout_ms: u64) -> Option<u64> {
+        let addr = format!("{hostname}:{port}");
+        let start = std::time::Instant::now();
+        let res = tokio::time::timeout(
+            Duration::from_millis(timeout_ms),
+            tokio::net::TcpStream::connect(&addr),
+        )
+        .await;
+        match res {
+            Ok(Ok(_)) => Some(start.elapsed().as_millis().max(1) as u64),
+            _ => None,
+        }
+    }
+
+    /// Lists identities currently loaded in the local OS SSH Agent (OpenSSH / Pageant / macOS Keychain Agent).
+    pub async fn list_local_agent_identities() -> Result<Vec<AgentIdentityInfo>, String> {
+        fn map_identities(raw: Vec<AgentIdentity>) -> Vec<AgentIdentityInfo> {
+            raw.into_iter()
+                .map(|id| match id {
+                    AgentIdentity::PublicKey { key, comment } => AgentIdentityInfo {
+                        comment,
+                        algorithm: key.algorithm().to_string(),
+                        fingerprint_sha256: key.fingerprint(HashAlg::Sha256).to_string(),
+                        is_certificate: false,
+                    },
+                    AgentIdentity::Certificate {
+                        certificate,
+                        comment,
+                    } => AgentIdentityInfo {
+                        comment,
+                        algorithm: certificate.algorithm().to_string(),
+                        fingerprint_sha256: certificate
+                            .public_key()
+                            .fingerprint(HashAlg::Sha256)
+                            .to_string(),
+                        is_certificate: true,
+                    },
+                })
+                .collect()
+        }
+
+        #[cfg(unix)]
+        {
+            let mut agent = AgentClient::connect_env()
+                .await
+                .map_err(|e| format!("SSH agent unavailable (check SSH_AUTH_SOCK): {e}"))?;
+            let ids = agent
+                .request_identities()
+                .await
+                .map_err(|e| format!("request_identities failed: {e}"))?;
+            Ok(map_identities(ids))
+        }
+
+        #[cfg(windows)]
+        {
+            if let Ok(mut agent) =
+                AgentClient::connect_named_pipe(r"\\.\pipe\openssh-ssh-agent").await
+            {
+                if let Ok(ids) = agent.request_identities().await {
+                    return Ok(map_identities(ids));
+                }
+            }
+            if let Ok(mut pageant) = AgentClient::connect_pageant().await {
+                if let Ok(ids) = pageant.request_identities().await {
+                    return Ok(map_identities(ids));
+                }
+            }
+            Err("No local SSH agent running (start Windows OpenSSH Authentication Agent or Pageant).".into())
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = map_identities;
+            Err("Local SSH agent inspection is not supported on this platform.".into())
+        }
+    }
+
     async fn connect_single(
         target: &SshTarget,
         verifier: Arc<dyn HostKeyVerifier>,
@@ -368,12 +663,18 @@ impl SshSessionManager {
             verifier: Arc::clone(&verifier),
             disconnect_reason: Arc::clone(&disconnect_reason),
             remote_forwards: Arc::clone(&remote_forwards),
+            forward_agent: target.forward_agent,
         };
 
         let mut handle = match tunnel {
             None => {
                 let addr = format!("{}:{}", target.hostname, target.port);
-                let stream = Self::connect_tcp_with_keepalive(&addr).await?;
+                let stream = Self::dial_tcp_or_proxy(
+                    &target.hostname,
+                    target.port,
+                    target.proxy_url.as_deref(),
+                )
+                .await?;
                 client::connect_stream(config, stream, handler)
                     .await
                     .map_err(|e| SshError::Connect(format!("{}: {}", addr, e)))?
@@ -696,6 +997,12 @@ impl SshSessionManager {
             .request_pty(false, "xterm-256color", req.cols, req.rows, 0, 0, &[])
             .await
             .map_err(|e| SshError::Channel(e.to_string()))?;
+
+        if req.target.forward_agent {
+            if let Err(e) = channel.agent_forward(false).await {
+                warn!("SSH agent forwarding request failed: {e}");
+            }
+        }
 
         channel
             .request_shell(false)
@@ -1306,4 +1613,98 @@ async fn handle_socks5_client(
     }
     counters.active_connections.fetch_sub(1, Ordering::Relaxed);
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProxyScheme {
+    Http,
+    Socks5,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedProxy {
+    scheme: ProxyScheme,
+    host: String,
+    port: u16,
+    auth: Option<(String, String)>,
+}
+
+fn parse_proxy_url(raw: &str) -> SshResult<ParsedProxy> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    let (scheme, rest, default_port) = if let Some(r) = trimmed.strip_prefix("socks5://") {
+        (ProxyScheme::Socks5, r, 1080u16)
+    } else if let Some(r) = trimmed.strip_prefix("socks5h://") {
+        (ProxyScheme::Socks5, r, 1080u16)
+    } else if let Some(r) = trimmed.strip_prefix("http://") {
+        (ProxyScheme::Http, r, 8080u16)
+    } else {
+        return Err(SshError::Connect(format!(
+            "unsupported proxy URL '{raw}' (use socks5://host:port or http://host:port)"
+        )));
+    };
+
+    let (auth, host_port) = if let Some((userinfo, hp)) = rest.rsplit_once('@') {
+        let (u, p) = userinfo
+            .split_once(':')
+            .map(|(u, p)| (u.to_string(), p.to_string()))
+            .unwrap_or_else(|| (userinfo.to_string(), String::new()));
+        (Some((u, p)), hp)
+    } else {
+        (None, rest)
+    };
+
+    let (host, port) = if let Some(bracket_rest) = host_port.strip_prefix('[') {
+        let (ipv6, after) = bracket_rest
+            .split_once(']')
+            .ok_or_else(|| SshError::Connect(format!("invalid IPv6 proxy host in '{raw}'")))?;
+        let port = after
+            .strip_prefix(':')
+            .map(|p| p.parse::<u16>())
+            .transpose()
+            .map_err(|_| SshError::Connect(format!("invalid proxy port in '{raw}'")))?
+            .unwrap_or(default_port);
+        (ipv6.to_string(), port)
+    } else if let Some((h, p)) = host_port.rsplit_once(':') {
+        let port = p
+            .parse::<u16>()
+            .map_err(|_| SshError::Connect(format!("invalid proxy port in '{raw}'")))?;
+        (h.to_string(), port)
+    } else {
+        (host_port.to_string(), default_port)
+    };
+
+    if host.is_empty() || port == 0 {
+        return Err(SshError::Connect(format!("invalid proxy address in '{raw}'")));
+    }
+
+    Ok(ParsedProxy {
+        scheme,
+        host,
+        port,
+        auth,
+    })
+}
+
+#[cfg(test)]
+mod proxy_tests {
+    use super::*;
+
+    #[test]
+    fn parses_socks5_and_http_proxy_urls() {
+        let p1 = parse_proxy_url("socks5://127.0.0.1:1080").unwrap();
+        assert_eq!(p1.scheme, ProxyScheme::Socks5);
+        assert_eq!(p1.host, "127.0.0.1");
+        assert_eq!(p1.port, 1080);
+        assert!(p1.auth.is_none());
+
+        let u = uuid::Uuid::new_v4().to_string();
+        let v = uuid::Uuid::new_v4().to_string();
+        let p2 = parse_proxy_url(&format!("http://{u}:{v}@proxy.corp:3128/")).unwrap();
+        assert_eq!(p2.scheme, ProxyScheme::Http);
+        assert_eq!(p2.host, "proxy.corp");
+        assert_eq!(p2.port, 3128);
+        assert_eq!(p2.auth, Some((u, v)));
+
+        assert!(parse_proxy_url("ftp://bad:21").is_err());
+    }
 }

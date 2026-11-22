@@ -23,6 +23,7 @@ use crate::{
 pub struct VaultStore {
     conn: Connection,
     dek: Option<SecretKey>,
+    vault_key: Option<SecretKey>,
     kdf_params: KdfParams,
 }
 
@@ -35,6 +36,7 @@ impl VaultStore {
         let store = Self {
             conn,
             dek: None,
+            vault_key: None,
             kdf_params: KdfParams::default(),
         };
         store.migrate()?;
@@ -46,6 +48,7 @@ impl VaultStore {
         let store = Self {
             conn,
             dek: None,
+            vault_key: None,
             kdf_params: KdfParams::fast_for_tests(),
         };
         store.migrate()?;
@@ -165,12 +168,14 @@ impl VaultStore {
         }
 
         self.dek = Some(dek);
+        self.vault_key = Some(derived.vault_key);
         self.status()
     }
 
     /// Clears all cached local vault items and metadata (used when switching accounts or deleting an account).
     pub fn reset_local_vault(&mut self) -> VaultResult<()> {
         self.dek = None;
+        self.vault_key = None;
         self.conn.execute_batch(
             "
             DELETE FROM vault_items;
@@ -211,6 +216,7 @@ impl VaultStore {
             let _ = keychain::store_vault_key_in_os_keychain(new_vault_key);
         }
         self.dek = Some(dek);
+        self.vault_key = Some(new_vault_key.clone());
         Ok(())
     }
 
@@ -243,6 +249,7 @@ impl VaultStore {
         }
 
         self.dek = Some(dek);
+        self.vault_key = Some(derived.vault_key);
         self.status()
     }
 
@@ -279,6 +286,7 @@ impl VaultStore {
         }
 
         self.dek = Some(dek);
+        self.vault_key = Some(derived.vault_key);
         self.status()
     }
 
@@ -302,14 +310,29 @@ impl VaultStore {
         match unwrap_dek(&vault_key, &wrapped_dek) {
             Ok(dek) => {
                 self.dek = Some(dek);
+                self.vault_key = Some(vault_key);
                 Ok(true)
             }
             Err(_) => Ok(false),
         }
     }
 
+    /// Enables or disables storing the unlocked vault key in the OS Keychain from Settings.
+    pub fn set_keychain_unlock_enabled(&self, enabled: bool) -> VaultResult<VaultStatus> {
+        if enabled {
+            let vk = self.vault_key.as_ref().ok_or(VaultError::Locked)?;
+            keychain::store_vault_key_in_os_keychain(vk)?;
+            self.set_meta("keychain_enabled", b"1")?;
+        } else {
+            keychain::clear_vault_key_from_os_keychain()?;
+            self.set_meta("keychain_enabled", b"0")?;
+        }
+        self.status()
+    }
+
     pub fn lock(&mut self) {
         self.dek = None;
+        self.vault_key = None;
     }
 
     pub fn change_master_password(
@@ -339,6 +362,7 @@ impl VaultStore {
         }
 
         self.dek = Some(dek);
+        self.vault_key = Some(new_derived.vault_key);
         Ok(())
     }
 
@@ -471,6 +495,13 @@ impl VaultStore {
 
     pub fn get_host(&self, id: &str) -> VaultResult<HostRecord> {
         self.get_item(id, EntityType::Host)
+    }
+
+    pub fn mark_host_connected(&self, id: &str) -> VaultResult<()> {
+        let mut host = self.get_host(id)?;
+        host.last_connected_at = Some(Utc::now().timestamp_millis());
+        self.upsert_host(host)?;
+        Ok(())
     }
 
     // --- Groups ---
@@ -775,9 +806,20 @@ mod tests {
                 keepalive_secs: 30,
                 startup_command: None,
                 notes: None,
+                auth_mode: Default::default(),
+                forward_agent: true,
+                proxy_url: Some("socks5://127.0.0.1:1080".into()),
+                favorite: true,
+                last_connected_at: None,
                 updated_at: 0,
             })
             .expect("upsert host");
+
+        store.mark_host_connected(&host.id).expect("mark connected");
+        let refreshed = store.get_host(&host.id).expect("get host");
+        assert!(refreshed.last_connected_at.is_some());
+        assert!(refreshed.forward_agent);
+        assert!(refreshed.favorite);
 
         let _cred = store
             .upsert_credential(CredentialRecord {

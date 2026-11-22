@@ -6,21 +6,25 @@ use std::time::{Duration, Instant};
 use core_crypto::ssh_keygen::generate_ed25519_keypair;
 use core_sftp::{
     manager::SftpManager,
-    types::{TransferDirection, TransferStatus},
+    types::{TransferDirection, TransferProgress, TransferStatus},
 };
-use core_ssh::types::{
-    ConnectRequest, HostKeyChallenge, KeyboardInteractiveChallenge, SshAuthMethod, SshTarget,
-    TerminalEvent, TunnelStats,
+use core_ssh::{
+    manager::SshSessionManager,
+    types::{
+        AgentIdentityInfo, ConnectRequest, HostKeyChallenge, KeyboardInteractiveChallenge,
+        SshAuthMethod, SshTarget, TerminalEvent, TunnelStats,
+    },
 };
 use core_vault::{
     backup::{export_encrypted_backup, import_encrypted_backup},
     models::{
-        CommandRecord, CredentialKind, GroupRecord, HostRecord, PortForwardKind, PortForwardRecord,
-        VaultSnapshot, VaultStatus,
+        CommandRecord, CredentialKind, GroupRecord, HostAuthMode, HostRecord, PortForwardKind,
+        PortForwardRecord, VaultSnapshot, VaultStatus,
     },
     ssh_config::{
-        default_ssh_config_path, detect_local_ssh_dir, import_parsed_hosts, parse_ssh_config_file,
-        sync_local_ssh_dir, LocalSshDiscovery, ParsedSshHost,
+        default_ssh_config_path, detect_local_ssh_dir, export_hosts_to_ssh_config,
+        import_parsed_hosts, parse_ssh_config_file, sync_local_ssh_dir, LocalSshDiscovery,
+        ParsedSshHost,
     },
 };
 use gpui::{
@@ -33,8 +37,9 @@ use uuid::Uuid;
 
 use crate::backend::{
     build_connect_request_for_host, build_ssh_copy_id_command, build_validated_credential,
-    is_ssh_auth_error, run_sync_change_password, run_sync_delete_account, run_sync_login,
-    run_sync_now, run_sync_register, BackendServices, PublicSyncStatus, UiEvent,
+    is_ssh_auth_error, open_file_in_external_editor, run_sync_change_password,
+    run_sync_delete_account, run_sync_login, run_sync_now, run_sync_register, verify_os_biometric,
+    BackendServices, PublicSyncStatus, UiEvent,
 };
 use crate::command_suggestions::{
     compute_insert_payload, extract_template_vars, rank_command_suggestions, render_template,
@@ -74,6 +79,13 @@ pub enum SettingsTab {
     Terminal,
     Account,
     Security,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeychainTab {
+    Credentials,
+    KnownHosts,
+    Agent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,6 +196,7 @@ pub enum ActiveModal {
     HostKey(HostKeyChallenge),
     KeyboardInteractive(KeyboardInteractiveChallenge),
     Confirm(ConfirmAction),
+    ShortcutsHelp,
 }
 
 pub struct StermAdminApp {
@@ -283,11 +296,16 @@ pub struct StermAdminApp {
     pub selected_credential_id: Option<String>,
     pub selected_jump_host_id: Option<String>,
     pub selected_terminal_theme: Option<String>,
+    pub qc_auth_mode: HostAuthMode,
+    pub qc_forward_agent: bool,
+    pub qc_proxy_url: Entity<TextField>,
+    pub qc_favorite: bool,
 
     // Group Editor fields
     pub grp_name_input: Entity<TextField>,
     pub grp_default_user_input: Entity<TextField>,
     pub grp_default_cred_id: Option<String>,
+    pub grp_parent_id: Option<String>,
 
     // SFTP editable path bars + inline mkdir + Remote modals
     pub sftp_local_path_input: Entity<TextField>,
@@ -327,7 +345,16 @@ pub struct StermAdminApp {
     pub tun_bind_port: Entity<TextField>,
     pub tun_target_host: Entity<TextField>,
     pub tun_target_port: Entity<TextField>,
+    pub tun_auto_start: bool,
     pub snippet_var_inputs: Vec<Entity<TextField>>,
+
+    // Phase 4: Host Latency Ping, Keychain Tabs & Live SSH Agent Inspector
+    pub host_latencies: HashMap<String, Option<u64>>,
+    pub latency_probing: bool,
+    pub keychain_tab: KeychainTab,
+    pub keychain_search: Entity<TextField>,
+    pub agent_identities: Vec<AgentIdentityInfo>,
+    pub agent_error: Option<String>,
 }
 
 impl Focusable for StermAdminApp {
@@ -455,6 +482,12 @@ impl StermAdminApp {
         let qc_cert_openssh = cx.new(|cx| {
             TextField::new("ssh-ed25519-cert-v01@openssh.com ...", cx).with_monospace(true)
         });
+        let qc_proxy_url = cx.new(|cx| {
+            TextField::new("Proxy URL (e.g. socks5://127.0.0.1:1080 or http://proxy:8080)", cx)
+                .with_monospace(true)
+        });
+        let keychain_search =
+            cx.new(|cx| TextField::new("Filter credentials, keys, known hosts...", cx).with_compact(true));
 
         let grp_name_input = cx.new(|cx| TextField::new("Group name (e.g. Production)", cx));
         let grp_default_user_input =
@@ -561,7 +594,7 @@ impl StermAdminApp {
         })
         .detach();
 
-        for filter_field in [&server_search, &snippet_search, &sftp_host_filter] {
+        for filter_field in [&server_search, &snippet_search, &sftp_host_filter, &keychain_search] {
             cx.subscribe(filter_field, |_this, _, ev: &TextFieldEvent, cx| {
                 if matches!(ev, TextFieldEvent::Changed(_)) {
                     cx.notify();
@@ -766,9 +799,14 @@ impl StermAdminApp {
             selected_credential_id: None,
             selected_jump_host_id: None,
             selected_terminal_theme: None,
+            qc_auth_mode: HostAuthMode::Credential,
+            qc_forward_agent: false,
+            qc_proxy_url,
+            qc_favorite: false,
             grp_name_input,
             grp_default_user_input,
             grp_default_cred_id: None,
+            grp_parent_id: None,
             sftp_local_path_input,
             sftp_remote_path_input,
             sftp_mkdir_input,
@@ -800,7 +838,14 @@ impl StermAdminApp {
             tun_bind_port,
             tun_target_host,
             tun_target_port,
+            tun_auto_start: false,
             snippet_var_inputs: Vec::new(),
+            host_latencies: HashMap::new(),
+            latency_probing: false,
+            keychain_tab: KeychainTab::Credentials,
+            keychain_search,
+            agent_identities: Vec::new(),
+            agent_error: None,
         };
 
         // Background ticker: polls active SSH tunnel traffic stats (2s) and checks Auto-Lock idle timer (15s)
@@ -844,8 +889,11 @@ impl StermAdminApp {
             self.page = target;
             self.page_epoch = self.page_epoch.wrapping_add(1);
         }
-        if target == AdminPage::Sftp {
+        if target == AdminPage::Sftp && !self.sftp_state.is_left_remote() {
             self.refresh_local_dir(self.sftp_state.local_path.clone());
+        }
+        if target == AdminPage::Keychain && self.keychain_tab == KeychainTab::Agent {
+            self.refresh_agent_identities(cx);
         }
         cx.notify();
     }
@@ -921,6 +969,8 @@ impl StermAdminApp {
             &self.qc_key_pem,
             &self.qc_key_passphrase,
             &self.qc_cert_openssh,
+            &self.qc_proxy_url,
+            &self.keychain_search,
             &self.grp_name_input,
             &self.grp_default_user_input,
             &self.sftp_local_path_input,
@@ -1638,10 +1688,20 @@ impl StermAdminApp {
             });
             self.qc_notes
                 .update(cx, |f, cx| f.set_value(h.notes.clone().unwrap_or_default(), cx));
+            self.qc_proxy_url.update(cx, |f, cx| {
+                f.set_value(h.proxy_url.clone().unwrap_or_default(), cx)
+            });
             self.selected_credential_id = h.credential_id.clone();
             self.selected_jump_host_id = h.jump_host_id.clone();
             self.selected_terminal_theme = h.terminal_theme.clone();
-            self.qc_auth_choice = existing_cred_kind.unwrap_or(CredentialKind::Password);
+            self.qc_auth_mode = h.auth_mode;
+            self.qc_forward_agent = h.forward_agent;
+            self.qc_favorite = h.favorite;
+            self.qc_auth_choice = match h.auth_mode {
+                HostAuthMode::SshAgent => CredentialKind::SshAgent,
+                HostAuthMode::KeyboardInteractive => CredentialKind::KeyboardInteractive,
+                HostAuthMode::Credential => existing_cred_kind.unwrap_or(CredentialKind::Password),
+            };
             self.open_modal(
                 ActiveModal::HostEditor {
                     editing_id: Some(h.id.clone()),
@@ -1663,9 +1723,13 @@ impl StermAdminApp {
             self.qc_keepalive.update(cx, |f, cx| f.set_value(ka, cx));
             self.qc_startup_cmd.update(cx, |f, cx| f.clear(cx));
             self.qc_notes.update(cx, |f, cx| f.clear(cx));
+            self.qc_proxy_url.update(cx, |f, cx| f.clear(cx));
             self.selected_credential_id = None;
             self.selected_jump_host_id = None;
             self.selected_terminal_theme = None;
+            self.qc_auth_mode = HostAuthMode::Credential;
+            self.qc_forward_agent = false;
+            self.qc_favorite = false;
             self.qc_auth_choice = CredentialKind::Password;
             self.open_modal(ActiveModal::HostEditor { editing_id: None }, cx);
         }
@@ -1766,82 +1830,36 @@ impl StermAdminApp {
                 None
             };
 
-            let mut credential_id = self.selected_credential_id.clone();
+            let mut credential_id = if self.qc_auth_mode == HostAuthMode::Credential {
+                self.selected_credential_id.clone()
+            } else {
+                None
+            };
+            let mut effective_auth_mode = self.qc_auth_mode;
+            let proxy_url = {
+                let p = self.qc_proxy_url.read(cx).value().trim().to_string();
+                (!p.is_empty()).then_some(p)
+            };
 
-            match self.qc_auth_choice {
-                CredentialKind::Password if !inline_pw.is_empty() => {
-                    let reuse_id = existing_cred
-                        .as_ref()
-                        .filter(|c| c.kind == CredentialKind::Password)
-                        .map(|c| c.id.clone())
-                        .unwrap_or_default();
-                    let cred_label = existing_cred
-                        .as_ref()
-                        .filter(|c| c.kind == CredentialKind::Password)
-                        .map(|c| c.label.clone())
-                        .unwrap_or_else(|| format!("{display_label} (Password)"));
-                    let rec = build_validated_credential(
-                        reuse_id,
-                        cred_label,
-                        CredentialKind::Password,
-                        Some(username.clone()),
-                        Some(inline_pw),
-                        None,
-                        None,
-                        None,
-                    )?;
-                    let saved = vault.upsert_credential(rec).map_err(|e| e.to_string())?;
-                    credential_id = Some(saved.id);
-                }
-                CredentialKind::PrivateKey if !inline_pem.is_empty() => {
-                    let rec = build_validated_credential(
-                        String::new(),
-                        format!("{display_label} (Key)"),
-                        CredentialKind::PrivateKey,
-                        Some(username.clone()),
-                        None,
-                        Some(inline_pem),
-                        (!inline_passphrase.is_empty()).then_some(inline_passphrase),
-                        None,
-                    )?;
-                    let saved = vault.upsert_credential(rec).map_err(|e| e.to_string())?;
-                    credential_id = Some(saved.id);
-                }
-                CredentialKind::Certificate if !inline_pem.is_empty() || !inline_cert.is_empty() => {
-                    if inline_pem.is_empty() || inline_cert.is_empty() {
-                        return Err(
-                            "Provide both the private key PEM and OpenSSH certificate (*-cert.pub)."
-                                .to_string(),
-                        );
-                    }
-                    let rec = build_validated_credential(
-                        String::new(),
-                        format!("{display_label} (Certificate)"),
-                        CredentialKind::Certificate,
-                        Some(username.clone()),
-                        None,
-                        Some(inline_pem),
-                        (!inline_passphrase.is_empty()).then_some(inline_passphrase),
-                        Some(inline_cert),
-                    )?;
-                    let saved = vault.upsert_credential(rec).map_err(|e| e.to_string())?;
-                    credential_id = Some(saved.id);
-                }
-                CredentialKind::SshAgent if credential_id.is_none() => {
-                    if let Some(reusable) = self
-                        .snapshot
-                        .credentials
-                        .iter()
-                        .find(|c| c.kind == CredentialKind::SshAgent)
-                    {
-                        credential_id = Some(reusable.id.clone());
-                    } else {
+            if effective_auth_mode == HostAuthMode::Credential {
+                match self.qc_auth_choice {
+                    CredentialKind::Password if !inline_pw.is_empty() => {
+                        let reuse_id = existing_cred
+                            .as_ref()
+                            .filter(|c| c.kind == CredentialKind::Password)
+                            .map(|c| c.id.clone())
+                            .unwrap_or_default();
+                        let cred_label = existing_cred
+                            .as_ref()
+                            .filter(|c| c.kind == CredentialKind::Password)
+                            .map(|c| c.label.clone())
+                            .unwrap_or_else(|| format!("{display_label} (Password)"));
                         let rec = build_validated_credential(
-                            String::new(),
-                            "Local SSH Agent".into(),
-                            CredentialKind::SshAgent,
-                            None,
-                            None,
+                            reuse_id,
+                            cred_label,
+                            CredentialKind::Password,
+                            Some(username.clone()),
+                            Some(inline_pw),
                             None,
                             None,
                             None,
@@ -1849,31 +1867,52 @@ impl StermAdminApp {
                         let saved = vault.upsert_credential(rec).map_err(|e| e.to_string())?;
                         credential_id = Some(saved.id);
                     }
-                }
-                CredentialKind::KeyboardInteractive if credential_id.is_none() => {
-                    if let Some(reusable) = self
-                        .snapshot
-                        .credentials
-                        .iter()
-                        .find(|c| c.kind == CredentialKind::KeyboardInteractive)
-                    {
-                        credential_id = Some(reusable.id.clone());
-                    } else {
+                    CredentialKind::PrivateKey if !inline_pem.is_empty() => {
                         let rec = build_validated_credential(
                             String::new(),
-                            "Keyboard-Interactive (2FA / PAM)".into(),
-                            CredentialKind::KeyboardInteractive,
+                            format!("{display_label} (Key)"),
+                            CredentialKind::PrivateKey,
+                            Some(username.clone()),
                             None,
-                            None,
-                            None,
-                            None,
+                            Some(inline_pem),
+                            (!inline_passphrase.is_empty()).then_some(inline_passphrase),
                             None,
                         )?;
                         let saved = vault.upsert_credential(rec).map_err(|e| e.to_string())?;
                         credential_id = Some(saved.id);
                     }
+                    CredentialKind::Certificate
+                        if !inline_pem.is_empty() || !inline_cert.is_empty() =>
+                    {
+                        if inline_pem.is_empty() || inline_cert.is_empty() {
+                            return Err(
+                                "Provide both the private key PEM and OpenSSH certificate (*-cert.pub)."
+                                    .to_string(),
+                            );
+                        }
+                        let rec = build_validated_credential(
+                            String::new(),
+                            format!("{display_label} (Certificate)"),
+                            CredentialKind::Certificate,
+                            Some(username.clone()),
+                            None,
+                            Some(inline_pem),
+                            (!inline_passphrase.is_empty()).then_some(inline_passphrase),
+                            Some(inline_cert),
+                        )?;
+                        let saved = vault.upsert_credential(rec).map_err(|e| e.to_string())?;
+                        credential_id = Some(saved.id);
+                    }
+                    CredentialKind::SshAgent if credential_id.is_none() => {
+                        // Decoupled from Keychain: store directly on HostRecord.auth_mode!
+                        effective_auth_mode = HostAuthMode::SshAgent;
+                    }
+                    CredentialKind::KeyboardInteractive if credential_id.is_none() => {
+                        // Decoupled from Keychain: store directly on HostRecord.auth_mode!
+                        effective_auth_mode = HostAuthMode::KeyboardInteractive;
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
 
             vault
@@ -1891,6 +1930,11 @@ impl StermAdminApp {
                     keepalive_secs,
                     startup_command,
                     notes,
+                    auth_mode: effective_auth_mode,
+                    forward_agent: self.qc_forward_agent,
+                    proxy_url,
+                    favorite: self.qc_favorite,
+                    last_connected_at: existing_host.as_ref().and_then(|h| h.last_connected_at),
                     updated_at: existing_host.map(|h| h.updated_at).unwrap_or(0),
                 })
                 .map_err(|e| e.to_string())?;
@@ -1917,6 +1961,7 @@ impl StermAdminApp {
                 f.set_value(g.default_username.clone().unwrap_or_default(), cx)
             });
             self.grp_default_cred_id = g.default_credential_id.clone();
+            self.grp_parent_id = g.parent_id.clone();
             self.open_modal(
                 ActiveModal::GroupEditor {
                     editing_id: Some(g.id.clone()),
@@ -1927,6 +1972,7 @@ impl StermAdminApp {
             self.grp_name_input.update(cx, |f, cx| f.clear(cx));
             self.grp_default_user_input.update(cx, |f, cx| f.clear(cx));
             self.grp_default_cred_id = None;
+            self.grp_parent_id = None;
             self.open_modal(ActiveModal::GroupEditor { editing_id: None }, cx);
         }
     }
@@ -1946,6 +1992,10 @@ impl StermAdminApp {
             .as_deref()
             .and_then(|eid| self.snapshot.groups.iter().find(|g| g.id == eid))
             .cloned();
+        let parent_id = self
+            .grp_parent_id
+            .clone()
+            .filter(|pid| editing_id.as_deref() != Some(pid.as_str()));
 
         let res = self
             .services
@@ -1956,7 +2006,7 @@ impl StermAdminApp {
                 v.upsert_group(GroupRecord {
                     id: editing_id.unwrap_or_default(),
                     name: name.clone(),
-                    parent_id: existing.as_ref().and_then(|g| g.parent_id.clone()),
+                    parent_id,
                     color: existing.as_ref().and_then(|g| g.color.clone()),
                     default_username: default_user,
                     default_credential_id: self.grp_default_cred_id.clone(),
@@ -2617,6 +2667,8 @@ impl StermAdminApp {
                     username: username.clone(),
                     auth,
                     keepalive_secs: self.settings.ssh_keepalive_secs,
+                    forward_agent: false,
+                    proxy_url: None,
                 },
                 cols,
                 rows,
@@ -2674,6 +2726,11 @@ impl StermAdminApp {
                     keepalive_secs: self.settings.ssh_keepalive_secs,
                     startup_command: None,
                     notes: None,
+                    auth_mode: HostAuthMode::Credential,
+                    forward_agent: false,
+                    proxy_url: None,
+                    favorite: false,
+                    last_connected_at: None,
                     updated_at: 0,
                 })
                 .map_err(|e| e.to_string())
@@ -2729,6 +2786,8 @@ impl StermAdminApp {
                 username: username.clone(),
                 auth,
                 keepalive_secs: self.settings.ssh_keepalive_secs,
+                forward_agent: false,
+                proxy_url: None,
             },
             cols: DEFAULT_TERM_COLS as u32,
             rows: DEFAULT_TERM_ROWS as u32,
@@ -3223,6 +3282,7 @@ impl StermAdminApp {
         if let Some(pf) = editing {
             self.tun_kind = pf.kind;
             self.tun_host_id = Some(pf.host_id.clone());
+            self.tun_auto_start = pf.auto_start;
             self.tun_label
                 .update(cx, |f, cx| f.set_value(pf.label.clone(), cx));
             self.tun_bind_addr
@@ -3252,6 +3312,7 @@ impl StermAdminApp {
         } else {
             self.tun_kind = PortForwardKind::Local;
             self.tun_host_id = self.snapshot.hosts.first().map(|h| h.id.clone());
+            self.tun_auto_start = false;
             self.tun_label.update(cx, |f, cx| f.clear(cx));
             self.tun_bind_addr
                 .update(cx, |f, cx| f.set_value("127.0.0.1", cx));
@@ -3313,7 +3374,7 @@ impl StermAdminApp {
             bind_port,
             target_host: (self.tun_kind != PortForwardKind::DynamicSocks5).then_some(target_host),
             target_port: (self.tun_kind != PortForwardKind::DynamicSocks5).then_some(target_port),
-            auto_start: false,
+            auto_start: self.tun_auto_start,
             updated_at: 0,
         };
         let res = self
@@ -3519,6 +3580,645 @@ impl StermAdminApp {
                 .send(UiEvent::KeyDeployed { host_label, result });
         });
         cx.notify();
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 4: Audit Closure — Host Favorites/Clone/Ping/Export, Rekey, Agent,
+    // OS Keychain Toggle, Biometric Unlock, Remote↔Remote SFTP & External Edit
+    // -------------------------------------------------------------------------
+
+    pub fn toggle_host_favorite(&mut self, host_id: String, cx: &mut Context<Self>) {
+        let Some(mut host) = self
+            .snapshot
+            .hosts
+            .iter()
+            .find(|h| h.id == host_id)
+            .cloned()
+        else {
+            return;
+        };
+        host.favorite = !host.favorite;
+        let starred = host.favorite;
+        let label = host.label.clone();
+        let save_err = self
+            .services
+            .vault
+            .lock()
+            .ok()
+            .and_then(|v| v.upsert_host(host).err());
+        if let Some(e) = save_err {
+            self.set_toast(format!("Failed to update host: {e}"), true);
+            cx.notify();
+            return;
+        }
+        self.reload_vault_snapshot();
+        self.maybe_auto_sync(cx);
+        self.set_toast(
+            if starred {
+                format!("Pinned '{label}' to Favorites.")
+            } else {
+                format!("Removed '{label}' from Favorites.")
+            },
+            false,
+        );
+        cx.notify();
+    }
+
+    pub fn clone_host(&mut self, host_id: String, cx: &mut Context<Self>) {
+        let Some(mut copy) = self
+            .snapshot
+            .hosts
+            .iter()
+            .find(|h| h.id == host_id)
+            .cloned()
+        else {
+            return;
+        };
+        copy.id = String::new();
+        copy.label = format!("{} (Copy)", copy.label);
+        copy.last_connected_at = None;
+        let label = copy.label.clone();
+        let save_res = self
+            .services
+            .vault
+            .lock()
+            .map_err(|_| "vault lock".to_string())
+            .and_then(|v| v.upsert_host(copy).map_err(|e| e.to_string()));
+        match save_res {
+            Ok(_) => {
+                self.reload_vault_snapshot();
+                self.maybe_auto_sync(cx);
+                self.set_toast(format!("Cloned host as '{label}'."), false);
+            }
+            Err(e) => self.set_toast(format!("Clone failed: {e}"), true),
+        }
+        cx.notify();
+    }
+
+    pub fn probe_all_host_latencies(&mut self, cx: &mut Context<Self>) {
+        let targets: Vec<(String, String, u16)> = self
+            .snapshot
+            .hosts
+            .iter()
+            .map(|h| (h.id.clone(), h.hostname.clone(), h.port))
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        self.latency_probing = true;
+        let services = Arc::clone(&self.services);
+        self.services.rt.spawn(async move {
+            let mut handles = Vec::with_capacity(targets.len());
+            for (id, host, port) in targets {
+                handles.push(tokio::spawn(async move {
+                    let rtt = SshSessionManager::probe_tcp_latency(&host, port, 1500).await;
+                    (id, rtt)
+                }));
+            }
+            let mut results = Vec::with_capacity(handles.len());
+            for h in handles {
+                if let Ok(pair) = h.await {
+                    results.push(pair);
+                }
+            }
+            let _ = services.ui_tx.send(UiEvent::HostLatencies(results));
+        });
+        cx.notify();
+    }
+
+    pub fn export_ssh_config_dialog(&mut self, cx: &mut Context<Self>) {
+        let content = export_hosts_to_ssh_config(&self.snapshot.hosts, &self.snapshot.groups);
+        let start_dir = dirs::home_dir()
+            .map(|h| h.join(".ssh"))
+            .filter(|p| p.exists())
+            .or_else(dirs::desktop_dir)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let rx = cx.prompt_for_new_path(&start_dir, Some("sterm-ssh-config"));
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+            if let Ok(Ok(Some(path))) = rx.await {
+                let res = std::fs::write(&path, content);
+                let _ = this.update(cx, |app, cx| {
+                    match res {
+                        Ok(()) => app.set_toast(
+                            format!("Exported OpenSSH config → {}", path.display()),
+                            false,
+                        ),
+                        Err(e) => app.set_toast(format!("Export failed: {e}"), true),
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    pub fn rekey_terminal_pane(&mut self, pane_id: String, cx: &mut Context<Self>) {
+        let sid = self
+            .terminal_tabs
+            .iter()
+            .find(|p| p.tab_id == pane_id && p.connected && !p.is_local)
+            .and_then(|p| p.session_id.clone());
+        let Some(session_id) = sid else {
+            return;
+        };
+        let services = Arc::clone(&self.services);
+        self.services.rt.spawn(async move {
+            match services.ssh.rekey_session(&session_id).await {
+                Ok(()) => {
+                    let _ = services.ui_tx.send(UiEvent::SftpNotice(
+                        "SSH session keys rotated (transport rekey complete).".into(),
+                    ));
+                }
+                Err(e) => {
+                    let _ = services
+                        .ui_tx
+                        .send(UiEvent::SftpError(format!("SSH rekey failed: {e}")));
+                }
+            }
+        });
+        cx.notify();
+    }
+
+    pub fn refresh_agent_identities(&mut self, cx: &mut Context<Self>) {
+        let services = Arc::clone(&self.services);
+        self.services.rt.spawn(async move {
+            let res = SshSessionManager::list_local_agent_identities().await;
+            let _ = services.ui_tx.send(UiEvent::AgentIdentitiesLoaded(res));
+        });
+        cx.notify();
+    }
+
+    pub fn toggle_os_keychain_unlock(&mut self, cx: &mut Context<Self>) {
+        let next = !self.vault_status.keychain_enabled;
+        let res = self
+            .services
+            .vault
+            .lock()
+            .map_err(|_| "vault lock".to_string())
+            .and_then(|v| {
+                v.set_keychain_unlock_enabled(next)
+                    .map_err(|e| e.to_string())
+            });
+        match res {
+            Ok(status) => {
+                self.vault_status = status;
+                if !next && self.settings.biometric_unlock {
+                    self.settings.biometric_unlock = false;
+                    self.save_settings(cx);
+                }
+                self.set_toast(
+                    if next {
+                        "Vault key saved in OS Keychain for quick unlock."
+                    } else {
+                        "Removed vault key from OS Keychain."
+                    },
+                    false,
+                );
+            }
+            Err(e) => self.set_toast(format!("OS Keychain update failed: {e}"), true),
+        }
+        cx.notify();
+    }
+
+    pub fn trigger_biometric_unlock(&mut self, cx: &mut Context<Self>) {
+        if self.unlock_busy {
+            return;
+        }
+        if !self.settings.biometric_unlock {
+            self.unlock_with_os_keychain(cx);
+            return;
+        }
+        self.unlock_busy = true;
+        let services = Arc::clone(&self.services);
+        self.services.rt.spawn_blocking(move || {
+            let res = verify_os_biometric("Unlock STerm SSH Vault");
+            let _ = services.ui_tx.send(UiEvent::BiometricUnlockResult(res));
+        });
+        cx.notify();
+    }
+
+    pub fn unlock_with_os_keychain(&mut self, cx: &mut Context<Self>) {
+        self.unlock_busy = false;
+        let res = self
+            .services
+            .vault
+            .lock()
+            .map_err(|_| "vault lock".to_string())
+            .and_then(|mut v| {
+                let unlocked = v.try_unlock_from_os_keychain().map_err(|e| e.to_string())?;
+                if unlocked {
+                    v.status().map(Some).map_err(|e| e.to_string())
+                } else {
+                    Ok(None)
+                }
+            });
+        match res {
+            Ok(Some(status)) => {
+                self.vault_status = status;
+                self.reload_vault_snapshot();
+                self.page_epoch = self.page_epoch.wrapping_add(1);
+                self.set_toast("Vault unlocked via OS Keychain.", false);
+                self.spawn_detect_local_ssh();
+                self.maybe_auto_sync(cx);
+            }
+            Ok(None) => {
+                self.set_toast(
+                    "No saved OS Keychain key found. Enter your master password to unlock.",
+                    true,
+                );
+            }
+            Err(e) => {
+                self.set_toast(format!("OS Keychain unlock failed: {e}"), true);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Returns hierarchical display name for a group (`Parent / Child`).
+    pub fn group_display_path(&self, group_id: &str) -> String {
+        let mut parts = Vec::new();
+        let mut cursor = Some(group_id.to_string());
+        let mut depth = 0;
+        while let Some(gid) = cursor {
+            if depth > 6 {
+                break;
+            }
+            depth += 1;
+            if let Some(g) = self.snapshot.groups.iter().find(|g| g.id == gid) {
+                parts.push(g.name.clone());
+                cursor = g.parent_id.clone();
+            } else {
+                break;
+            }
+        }
+        parts.reverse();
+        parts.join(" / ")
+    }
+
+    // --- Remote ↔ Remote SFTP & External Editor Watch-Upload + Retry ---
+
+    fn close_left_remote_sftp_if_standalone(&self) {
+        if let Some(prev_sid) = self.sftp_state.left_remote_session_id.clone() {
+            let is_standalone = self
+                .services
+                .sftp_only_sessions
+                .lock()
+                .map(|mut s| s.remove(&prev_sid))
+                .unwrap_or(false);
+            if is_standalone {
+                let services = Arc::clone(&self.services);
+                self.services.rt.spawn(async move {
+                    services.sftp.close(&prev_sid).await;
+                    let _ = services.ssh.close_session(&prev_sid).await;
+                });
+            }
+        }
+    }
+
+    pub fn reset_sftp_left_to_local(&mut self, cx: &mut Context<Self>) {
+        self.close_left_remote_sftp_if_standalone();
+        self.sftp_state.left_remote_session_id = None;
+        self.sftp_state.left_remote_host_id = None;
+        self.sftp_state.left_remote_host_label = None;
+        self.sftp_state.selected_local = None;
+        self.sftp_state.selected_local_paths.clear();
+        let default_local = SftpManager::default_local_dir();
+        self.sftp_state.local_path = default_local.clone();
+        self.sftp_local_path_input
+            .update(cx, |f, cx| f.set_value(default_local.clone(), cx));
+        self.refresh_local_dir(default_local);
+        cx.notify();
+    }
+
+    pub fn open_sftp_left_remote(&mut self, host_id: String, cx: &mut Context<Self>) {
+        let built = {
+            let vault = match self.services.vault.lock() {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            build_connect_request_for_host(&vault, &host_id, 80, 24, None)
+        };
+        let (host, req) = match built {
+            Ok(v) => v,
+            Err(e) => {
+                self.set_toast(format!("Left SFTP connect failed: {e}"), true);
+                cx.notify();
+                return;
+            }
+        };
+
+        self.close_left_remote_sftp_if_standalone();
+        self.sftp_state.loading_local = true;
+        let services = Arc::clone(&self.services);
+        let label = host.label.clone();
+        let hid = host.id.clone();
+        self.services.rt.spawn(async move {
+            let verifier = services.verifier();
+            match services.ssh.connect_transport_only(req, verifier).await {
+                Ok(session_id) => {
+                    if let Ok(mut set) = services.sftp_only_sessions.lock() {
+                        set.insert(session_id.clone());
+                    }
+                    match services.sftp.attach_to_ssh(&services.ssh, &session_id).await {
+                        Ok(remote_cwd) => {
+                            let _ = services.ui_tx.send(UiEvent::SftpLeftRemoteConnected {
+                                session_id: session_id.clone(),
+                                host_id: hid,
+                                host_label: label,
+                                remote_cwd: remote_cwd.clone(),
+                            });
+                            if let Ok((resolved, entries)) =
+                                services.sftp.list_remote_dir(&session_id, &remote_cwd).await
+                            {
+                                let _ = services.ui_tx.send(UiEvent::SftpLeftRemoteListed {
+                                    session_id,
+                                    path: resolved,
+                                    entries,
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            let _ = services
+                                .ui_tx
+                                .send(UiEvent::SftpError(format!("Left SFTP error: {e}")));
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = services
+                        .ui_tx
+                        .send(UiEvent::SftpError(format!("Left SSH transport error: {e}")));
+                }
+            }
+        });
+        cx.notify();
+    }
+
+    pub fn refresh_left_pane(&mut self, path: String) {
+        if let Some(sid) = self.sftp_state.left_remote_session_id.clone() {
+            self.sftp_state.loading_local = true;
+            let services = Arc::clone(&self.services);
+            self.services.rt.spawn(async move {
+                match services.sftp.list_remote_dir(&sid, &path).await {
+                    Ok((resolved, entries)) => {
+                        let _ = services.ui_tx.send(UiEvent::SftpLeftRemoteListed {
+                            session_id: sid,
+                            path: resolved,
+                            entries,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = services
+                            .ui_tx
+                            .send(UiEvent::SftpError(format!("Left remote dir error: {e}")));
+                    }
+                }
+            });
+        } else {
+            self.refresh_local_dir(path);
+        }
+    }
+
+    pub fn transfer_left_to_right(
+        &mut self,
+        src_path: String,
+        name: String,
+        is_dir: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(left_sid) = self.sftp_state.left_remote_session_id.clone() {
+            let Some(right_sid) = self.sftp_state.session_id.clone() else {
+                self.set_toast("Connect a Right remote host first.", true);
+                cx.notify();
+                return;
+            };
+            let dst_path = join_remote_path(&self.sftp_state.remote_path, &name);
+            let dst_dir = self.sftp_state.remote_path.clone();
+            let services = Arc::clone(&self.services);
+            self.services.rt.spawn(async move {
+                let tx = services.ui_tx.clone();
+                let res = if is_dir {
+                    services
+                        .sftp
+                        .transfer_remote_dir_to_remote(
+                            &left_sid,
+                            &src_path,
+                            &right_sid,
+                            &dst_path,
+                            move |p| {
+                                let _ = tx.send(UiEvent::SftpTransfer(p));
+                            },
+                        )
+                        .await
+                        .map(|n| format!("Transferred folder '{name}' ({n} file(s)) Remote → Remote."))
+                } else {
+                    services
+                        .sftp
+                        .transfer_remote_to_remote(
+                            &left_sid,
+                            &src_path,
+                            &right_sid,
+                            &dst_path,
+                            move |p| {
+                                let _ = tx.send(UiEvent::SftpTransfer(p));
+                            },
+                        )
+                        .await
+                        .map(|_| format!("Transferred '{name}' Remote → Remote."))
+                };
+                match res {
+                    Ok(msg) => {
+                        let _ = services.ui_tx.send(UiEvent::SftpNotice(msg));
+                        if let Ok((resolved, entries)) =
+                            services.sftp.list_remote_dir(&right_sid, &dst_dir).await
+                        {
+                            let _ = services.ui_tx.send(UiEvent::SftpRemoteListed {
+                                session_id: right_sid,
+                                path: resolved,
+                                entries,
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        let _ = services
+                            .ui_tx
+                            .send(UiEvent::SftpError(format!("Remote→Remote failed: {e}")));
+                    }
+                }
+            });
+            cx.notify();
+            return;
+        }
+        if is_dir {
+            self.upload_local_dir(src_path, name, cx);
+        } else {
+            self.upload_local_file_checked(src_path, name, cx);
+        }
+    }
+
+    pub fn transfer_right_to_left(
+        &mut self,
+        src_path: String,
+        name: String,
+        is_dir: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(left_sid) = self.sftp_state.left_remote_session_id.clone() {
+            let Some(right_sid) = self.sftp_state.session_id.clone() else {
+                return;
+            };
+            let dst_path = join_remote_path(&self.sftp_state.local_path, &name);
+            let dst_dir = self.sftp_state.local_path.clone();
+            let services = Arc::clone(&self.services);
+            self.services.rt.spawn(async move {
+                let tx = services.ui_tx.clone();
+                let res = if is_dir {
+                    services
+                        .sftp
+                        .transfer_remote_dir_to_remote(
+                            &right_sid,
+                            &src_path,
+                            &left_sid,
+                            &dst_path,
+                            move |p| {
+                                let _ = tx.send(UiEvent::SftpTransfer(p));
+                            },
+                        )
+                        .await
+                        .map(|n| format!("Transferred folder '{name}' ({n} file(s)) Remote ← Remote."))
+                } else {
+                    services
+                        .sftp
+                        .transfer_remote_to_remote(
+                            &right_sid,
+                            &src_path,
+                            &left_sid,
+                            &dst_path,
+                            move |p| {
+                                let _ = tx.send(UiEvent::SftpTransfer(p));
+                            },
+                        )
+                        .await
+                        .map(|_| format!("Transferred '{name}' Remote ← Remote."))
+                };
+                match res {
+                    Ok(msg) => {
+                        let _ = services.ui_tx.send(UiEvent::SftpNotice(msg));
+                        if let Ok((resolved, entries)) =
+                            services.sftp.list_remote_dir(&left_sid, &dst_dir).await
+                        {
+                            let _ = services.ui_tx.send(UiEvent::SftpLeftRemoteListed {
+                                session_id: left_sid,
+                                path: resolved,
+                                entries,
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        let _ = services
+                            .ui_tx
+                            .send(UiEvent::SftpError(format!("Remote←Remote failed: {e}")));
+                    }
+                }
+            });
+            cx.notify();
+            return;
+        }
+        if is_dir {
+            self.download_remote_dir(src_path, name, cx);
+        } else {
+            self.download_remote_file_checked(src_path, name, cx);
+        }
+    }
+
+    /// Downloads a remote file to a temp path, launches the user's external editor, and watches
+    /// for file saves to automatically sync edits back to the remote host over SFTP.
+    pub fn open_remote_in_external_editor(
+        &mut self,
+        remote_path: String,
+        name: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session_id) = self.sftp_state.session_id.clone() else {
+            return;
+        };
+        let safe_name: String = name
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let temp_dir = std::env::temp_dir().join("sterm-external-edit");
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let temp_path = temp_dir.join(format!("{}-{safe_name}", Uuid::now_v7()));
+        let services = Arc::clone(&self.services);
+
+        self.set_toast(format!("Opening '{name}' in external editor (auto-upload on save)..."), false);
+        self.services.rt.spawn(async move {
+            if let Err(e) = services
+                .sftp
+                .download_file(&session_id, &remote_path, &temp_path, |_| {})
+                .await
+            {
+                let _ = services
+                    .ui_tx
+                    .send(UiEvent::SftpError(format!("External edit download failed: {e}")));
+                return;
+            }
+            if let Err(e) = open_file_in_external_editor(&temp_path) {
+                let _ = services.ui_tx.send(UiEvent::SftpError(e));
+                return;
+            }
+
+            let mut last_mtime = std::fs::metadata(&temp_path).and_then(|m| m.modified()).ok();
+            // Poll for saves every 1.5s for up to 30 minutes while session remains alive
+            for _ in 0..1200 {
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                if !temp_path.exists() {
+                    break;
+                }
+                let cur_mtime = std::fs::metadata(&temp_path).and_then(|m| m.modified()).ok();
+                if cur_mtime.is_some() && cur_mtime != last_mtime {
+                    last_mtime = cur_mtime;
+                    let tx = services.ui_tx.clone();
+                    match services
+                        .sftp
+                        .upload_file(&session_id, &temp_path, &remote_path, move |p| {
+                            let _ = tx.send(UiEvent::SftpTransfer(p));
+                        })
+                        .await
+                    {
+                        Ok(_) => {
+                            let _ = services.ui_tx.send(UiEvent::SftpNotice(format!(
+                                "Auto-uploaded saved edits → {remote_path}"
+                            )));
+                        }
+                        Err(e) => {
+                            let _ = services.ui_tx.send(UiEvent::SftpError(format!(
+                                "Auto-upload failed for {name}: {e}"
+                            )));
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        cx.notify();
+    }
+
+    pub fn retry_failed_transfer(&mut self, tr: TransferProgress, cx: &mut Context<Self>) {
+        match tr.direction {
+            TransferDirection::Upload => {
+                self.upload_local_file(tr.local_path, tr.file_name, cx);
+            }
+            TransferDirection::Download => {
+                self.download_remote_file(tr.remote_path, tr.file_name, cx);
+            }
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -3772,6 +4472,18 @@ impl StermAdminApp {
 
         if ks.key.eq_ignore_ascii_case("k") {
             self.open_command_palette(cx);
+        } else if ks.key == "/" || ks.key == "?" {
+            self.open_modal(ActiveModal::ShortcutsHelp, cx);
+        } else if ks.key.len() == 1
+            && let Some(digit) = ks.key.chars().next().and_then(|c| c.to_digit(10))
+            && (1..=9).contains(&digit)
+        {
+            if digit == 1 {
+                self.select_workspace_tab(None, _window, cx);
+            } else if let Some(ws) = self.workspace_tabs.get((digit - 2) as usize) {
+                let wid = ws.id.clone();
+                self.select_workspace_tab(Some(wid), _window, cx);
+            }
         } else if ks.key.eq_ignore_ascii_case("l") && ks.modifiers.shift {
             self.lock_vault(cx);
         } else if ks.key.eq_ignore_ascii_case("w") {
@@ -3810,6 +4522,23 @@ impl StermAdminApp {
         // Global shortcuts while terminal is focused
         if mod_key && ks.key.eq_ignore_ascii_case("k") {
             self.open_command_palette(cx);
+            return;
+        }
+        if mod_key && (ks.key == "/" || ks.key == "?") {
+            self.open_modal(ActiveModal::ShortcutsHelp, cx);
+            return;
+        }
+        if mod_key
+            && ks.key.len() == 1
+            && let Some(digit) = ks.key.chars().next().and_then(|c| c.to_digit(10))
+            && (1..=9).contains(&digit)
+        {
+            if digit == 1 {
+                self.select_workspace_tab(None, _window, cx);
+            } else if let Some(ws) = self.workspace_tabs.get((digit - 2) as usize) {
+                let wid = ws.id.clone();
+                self.select_workspace_tab(Some(wid), _window, cx);
+            }
             return;
         }
         if mod_key && ks.key.eq_ignore_ascii_case("f") {
@@ -4176,8 +4905,13 @@ impl StermAdminApp {
     }
 
     pub fn navigate_local_up(&mut self) {
-        let parent = parent_local_path(&self.sftp_state.local_path);
-        self.refresh_local_dir(parent);
+        if self.sftp_state.is_left_remote() {
+            let parent = parent_remote_path(&self.sftp_state.local_path);
+            self.refresh_left_pane(parent);
+        } else {
+            let parent = parent_local_path(&self.sftp_state.local_path);
+            self.refresh_local_dir(parent);
+        }
     }
 
     pub fn navigate_remote_up(&mut self) {
@@ -4186,8 +4920,13 @@ impl StermAdminApp {
     }
 
     pub fn navigate_local_to_input(&mut self, input: String, cx: &mut Context<Self>) {
-        let target = resolve_local_input(&self.sftp_state.local_path, &input);
-        self.refresh_local_dir(target);
+        if self.sftp_state.is_left_remote() {
+            let target = resolve_remote_input(&self.sftp_state.local_path, &input);
+            self.refresh_left_pane(target);
+        } else {
+            let target = resolve_local_input(&self.sftp_state.local_path, &input);
+            self.refresh_local_dir(target);
+        }
         cx.notify();
     }
 
@@ -4456,11 +5195,7 @@ impl StermAdminApp {
             .collect();
         self.sftp_state.selected_local_paths.clear();
         for entry in paths {
-            if entry.is_dir {
-                self.upload_local_dir(entry.path, entry.name, cx);
-            } else {
-                self.upload_local_file(entry.path, entry.name, cx);
-            }
+            self.transfer_left_to_right(entry.path, entry.name, entry.is_dir, cx);
         }
         cx.notify();
     }
@@ -4475,11 +5210,7 @@ impl StermAdminApp {
             .collect();
         self.sftp_state.selected_remote_paths.clear();
         for entry in paths {
-            if entry.is_dir {
-                self.download_remote_dir(entry.path, entry.name, cx);
-            } else {
-                self.download_remote_file(entry.path, entry.name, cx);
-            }
+            self.transfer_right_to_left(entry.path, entry.name, entry.is_dir, cx);
         }
         cx.notify();
     }
@@ -4488,22 +5219,24 @@ impl StermAdminApp {
         if dragged.side != SftpPaneSide::Local {
             return;
         }
-        if dragged.is_dir {
-            self.upload_local_dir(dragged.full_path.clone(), dragged.name.clone(), cx);
-        } else {
-            self.upload_local_file_checked(dragged.full_path.clone(), dragged.name.clone(), cx);
-        }
+        self.transfer_left_to_right(
+            dragged.full_path.clone(),
+            dragged.name.clone(),
+            dragged.is_dir,
+            cx,
+        );
     }
 
     pub fn handle_drop_on_local(&mut self, dragged: &DraggedSftpFile, cx: &mut Context<Self>) {
         if dragged.side != SftpPaneSide::Remote {
             return;
         }
-        if dragged.is_dir {
-            self.download_remote_dir(dragged.full_path.clone(), dragged.name.clone(), cx);
-        } else {
-            self.download_remote_file_checked(dragged.full_path.clone(), dragged.name.clone(), cx);
-        }
+        self.transfer_right_to_left(
+            dragged.full_path.clone(),
+            dragged.name.clone(),
+            dragged.is_dir,
+            cx,
+        );
     }
 
     pub fn handle_external_drop_on_remote(&mut self, paths: &ExternalPaths, cx: &mut Context<Self>) {
@@ -4995,6 +5728,7 @@ impl StermAdminApp {
                 ..
             } => {
                 let mut sync_info = None;
+                let mut connected_host_id = None;
                 if let Some(tab) = self.terminal_tabs.iter_mut().find(|t| t.tab_id == tab_id) {
                     tab.session_id = Some(session_id.clone());
                     tab.connected = true;
@@ -5002,6 +5736,7 @@ impl StermAdminApp {
                     tab.reconnect_attempts = 0;
                     tab.last_error = None;
                     tab.status_line = "Live · SSH-2.0".to_string();
+                    connected_host_id = tab.host_id.clone();
                     let cols = tab.cols;
                     let rows = tab.rows;
                     if let Ok(mut last) = tab.last_pty_size.lock() {
@@ -5018,6 +5753,26 @@ impl StermAdminApp {
                     self.services.rt.spawn(async move {
                         let _ = services.ssh.resize(&session_id, cols as u32, rows as u32).await;
                     });
+                }
+                if let Some(hid) = connected_host_id {
+                    if let Ok(v) = self.services.vault.lock() {
+                        let _ = v.mark_host_connected(&hid);
+                    }
+                    self.reload_vault_snapshot();
+                    let auto_tunnels: Vec<PortForwardRecord> = self
+                        .snapshot
+                        .port_forwards
+                        .iter()
+                        .filter(|pf| {
+                            pf.host_id == hid
+                                && pf.auto_start
+                                && !self.active_tunnels.contains_key(&pf.id)
+                        })
+                        .cloned()
+                        .collect();
+                    for pf in auto_tunnels {
+                        self.start_port_forward(pf, cx);
+                    }
                 }
                 self.set_toast(format!("Connected to {label}."), false);
             }
@@ -5378,6 +6133,73 @@ impl StermAdminApp {
                     self.set_toast(format!("Vault auto-locked after {mins}m of inactivity."), false);
                 }
             }
+            UiEvent::HostLatencies(results) => {
+                self.latency_probing = false;
+                for (id, rtt) in results {
+                    self.host_latencies.insert(id, rtt);
+                }
+            }
+            UiEvent::AgentIdentitiesLoaded(res) => match res {
+                Ok(list) => {
+                    self.agent_identities = list;
+                    self.agent_error = None;
+                }
+                Err(e) => {
+                    self.agent_identities.clear();
+                    self.agent_error = Some(e);
+                }
+            },
+            UiEvent::SftpLeftRemoteConnected {
+                session_id,
+                host_id,
+                host_label,
+                remote_cwd,
+            } => {
+                self.sftp_state.loading_local = false;
+                self.sftp_state.left_remote_session_id = Some(session_id);
+                self.sftp_state.left_remote_host_id = Some(host_id);
+                self.sftp_state.left_remote_host_label = Some(host_label.clone());
+                self.sftp_state.local_path = remote_cwd.clone();
+                self.sftp_local_path_input
+                    .update(cx, |f, cx| f.set_value(remote_cwd, cx));
+                self.sftp_state.selected_local = None;
+                self.sftp_state.selected_local_paths.clear();
+                self.sftp_state.reset_local_scroll();
+                self.set_toast(
+                    format!("Mounted remote host '{host_label}' on Left SFTP pane."),
+                    false,
+                );
+            }
+            UiEvent::SftpLeftRemoteListed {
+                session_id,
+                path,
+                entries,
+            } => {
+                self.sftp_state.loading_local = false;
+                if self.sftp_state.left_remote_session_id.as_deref() == Some(&session_id) {
+                    if self.sftp_state.local_path != path {
+                        self.sftp_state.selected_local = None;
+                        self.sftp_state.reset_local_scroll();
+                    }
+                    self.sftp_state.local_path = path.clone();
+                    self.sftp_local_path_input
+                        .update(cx, |f, cx| f.set_value(path, cx));
+                    self.sftp_state.local_entries = entries;
+                }
+            }
+            UiEvent::BiometricUnlockResult(res) => match res {
+                Ok(true) => {
+                    self.unlock_with_os_keychain(cx);
+                }
+                Ok(false) => {
+                    self.unlock_busy = false;
+                    self.set_toast("Biometric verification was cancelled or did not match.", true);
+                }
+                Err(e) => {
+                    self.unlock_busy = false;
+                    self.set_toast(format!("Biometric unlock unavailable: {e}"), true);
+                }
+            },
         }
     }
 }

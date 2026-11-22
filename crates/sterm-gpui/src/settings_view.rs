@@ -1386,6 +1386,36 @@ impl StermAdminApp {
                                             ),
                                     ),
                             )
+                            // OS Keychain Quick-Unlock & Biometric Unlock (Windows Hello / Touch ID)
+                            .child(self.settings_toggle_row(
+                                t,
+                                "set-keychain-unlock-toggle",
+                                "OS Keychain Quick-Unlock",
+                                "Store wrapped vault key in Windows Credential Manager / macOS Keychain",
+                                self.vault_status.keychain_enabled,
+                                cx.listener(|this, _, _, cx| {
+                                    this.toggle_os_keychain_unlock(cx);
+                                }),
+                            ))
+                            .child(self.settings_toggle_row(
+                                t,
+                                "set-biometric-unlock-toggle",
+                                "Require Biometrics (Windows Hello / Touch ID)",
+                                "Prompt for OS biometric verification before unlocking from OS Keychain",
+                                self.settings.biometric_unlock && self.vault_status.keychain_enabled,
+                                cx.listener(|this, _, _, cx| {
+                                    if !this.vault_status.keychain_enabled {
+                                        this.set_toast(
+                                            "Enable OS Keychain Quick-Unlock above first.",
+                                            true,
+                                        );
+                                        cx.notify();
+                                        return;
+                                    }
+                                    this.settings.biometric_unlock = !this.settings.biometric_unlock;
+                                    this.save_settings(cx);
+                                }),
+                            ))
                             .child(
                                 div()
                                     .p_3()
@@ -1395,14 +1425,6 @@ impl StermAdminApp {
                                     .flex_col()
                                     .gap_1()
                                     .text_xs()
-                                    .child(format!(
-                                        "OS Keychain Unlock: {}",
-                                        if self.vault_status.keychain_enabled {
-                                            "Enabled"
-                                        } else {
-                                            "Disabled"
-                                        }
-                                    ))
                                     .child(format!("Hosts: {}", self.snapshot.hosts.len()))
                                     .child(format!("Groups: {}", self.snapshot.groups.len()))
                                     .child(format!(
@@ -1426,20 +1448,44 @@ impl StermAdminApp {
                     )
                     .child(
                         div()
-                            .id("set-import-ssh-cfg")
-                            .py_2()
-                            .rounded_lg()
-                            .border_1()
-                            .border_color(t.border_strong)
-                            .text_xs()
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_center()
-                            .cursor_pointer()
-                            .hover(|s| s.bg(t.bg_subtle))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.open_ssh_config_import_modal(None, cx);
-                            }))
-                            .child("Import ~/.ssh/config (Selective Preview)..."),
+                            .flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("set-import-ssh-cfg")
+                                    .flex_1()
+                                    .py_2()
+                                    .rounded_lg()
+                                    .border_1()
+                                    .border_color(t.border_strong)
+                                    .text_xs()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_center()
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(t.bg_subtle))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.open_ssh_config_import_modal(None, cx);
+                                    }))
+                                    .child("Import ~/.ssh/config..."),
+                            )
+                            .child(
+                                div()
+                                    .id("set-export-ssh-cfg")
+                                    .flex_1()
+                                    .py_2()
+                                    .rounded_lg()
+                                    .border_1()
+                                    .border_color(t.border_strong)
+                                    .text_xs()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_center()
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(t.bg_subtle))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.export_ssh_config_dialog(cx);
+                                    }))
+                                    .child("Export ~/.ssh/config..."),
+                            ),
                     ),
             )
     }

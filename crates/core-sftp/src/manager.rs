@@ -613,6 +613,164 @@ impl SftpManager {
             }
         }
     }
+
+    /// Streams a file directly from one remote SFTP host (`src_session_id`) to another
+    /// (`dst_session_id`) in 64 KiB memory chunks without touching local disk.
+    pub async fn transfer_remote_to_remote<F>(
+        &self,
+        src_session_id: &str,
+        src_path: &str,
+        dst_session_id: &str,
+        dst_path: &str,
+        mut on_progress: F,
+    ) -> SftpResult<String>
+    where
+        F: FnMut(TransferProgress),
+    {
+        let src_sftp = self.get_session(src_session_id)?;
+        let dst_sftp = self.get_session(dst_session_id)?;
+        let transfer_id = Uuid::now_v7().to_string();
+        let token = CancellationToken::new();
+        self.transfers.insert(transfer_id.clone(), token.clone());
+
+        let meta = src_sftp
+            .metadata(src_path)
+            .await
+            .map_err(|e| SftpError::Protocol(e.to_string()))?;
+        let total_bytes = meta.size.unwrap_or(0);
+        let file_name = src_path.rsplit('/').next().unwrap_or("file").to_string();
+
+        let mut src_file = src_sftp
+            .open(src_path)
+            .await
+            .map_err(|e| SftpError::Protocol(e.to_string()))?;
+        let mut dst_file = dst_sftp
+            .create(dst_path)
+            .await
+            .map_err(|e| SftpError::Protocol(e.to_string()))?;
+
+        let mut buf = vec![0u8; CHUNK_SIZE];
+        let mut transferred = 0u64;
+
+        let res: SftpResult<()> = async {
+            loop {
+                if token.is_cancelled() {
+                    return Err(SftpError::Cancelled);
+                }
+                let n = src_file.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                dst_file.write_all(&buf[..n]).await?;
+                transferred += n as u64;
+                on_progress(TransferProgress {
+                    transfer_id: transfer_id.clone(),
+                    direction: TransferDirection::Upload,
+                    file_name: file_name.clone(),
+                    local_path: src_path.to_string(),
+                    remote_path: dst_path.to_string(),
+                    bytes_transferred: transferred,
+                    total_bytes,
+                    status: TransferStatus::Running,
+                    error: None,
+                });
+            }
+            dst_file.flush().await?;
+            Ok(())
+        }
+        .await;
+
+        self.transfers.remove(&transfer_id);
+
+        match res {
+            Ok(()) => {
+                on_progress(TransferProgress {
+                    transfer_id: transfer_id.clone(),
+                    direction: TransferDirection::Upload,
+                    file_name,
+                    local_path: src_path.to_string(),
+                    remote_path: dst_path.to_string(),
+                    bytes_transferred: transferred,
+                    total_bytes,
+                    status: TransferStatus::Completed,
+                    error: None,
+                });
+                Ok(transfer_id)
+            }
+            Err(SftpError::Cancelled) => {
+                on_progress(TransferProgress {
+                    transfer_id: transfer_id.clone(),
+                    direction: TransferDirection::Upload,
+                    file_name,
+                    local_path: src_path.to_string(),
+                    remote_path: dst_path.to_string(),
+                    bytes_transferred: transferred,
+                    total_bytes,
+                    status: TransferStatus::Cancelled,
+                    error: None,
+                });
+                Err(SftpError::Cancelled)
+            }
+            Err(e) => {
+                on_progress(TransferProgress {
+                    transfer_id: transfer_id.clone(),
+                    direction: TransferDirection::Upload,
+                    file_name,
+                    local_path: src_path.to_string(),
+                    remote_path: dst_path.to_string(),
+                    bytes_transferred: transferred,
+                    total_bytes,
+                    status: TransferStatus::Failed,
+                    error: Some(e.to_string()),
+                });
+                Err(e)
+            }
+        }
+    }
+
+    /// Recursively transfers a directory tree directly from one remote SFTP host to another.
+    pub async fn transfer_remote_dir_to_remote<F>(
+        &self,
+        src_session_id: &str,
+        src_dir: &str,
+        dst_session_id: &str,
+        dst_dir: &str,
+        mut on_progress: F,
+    ) -> SftpResult<usize>
+    where
+        F: FnMut(TransferProgress),
+    {
+        let mut queue = vec![(src_dir.to_string(), dst_dir.to_string())];
+        let mut count = 0usize;
+        while let Some((cur_src, cur_dst)) = queue.pop() {
+            let _ = self.remote_mkdir(dst_session_id, &cur_dst).await;
+            let (_, entries) = self.list_remote_dir(src_session_id, &cur_src).await?;
+            for ent in entries {
+                if ent.is_symlink {
+                    continue;
+                }
+                let child_dst = if cur_dst == "/" {
+                    format!("/{}", ent.name)
+                } else {
+                    format!("{}/{}", cur_dst.trim_end_matches('/'), ent.name)
+                };
+                if ent.is_dir {
+                    queue.push((ent.path, child_dst));
+                } else {
+                    self.transfer_remote_to_remote(
+                        src_session_id,
+                        &ent.path,
+                        dst_session_id,
+                        &child_dst,
+                        &mut on_progress,
+                    )
+                    .await?;
+                    count += 1;
+                }
+            }
+        }
+        Ok(count)
+    }
 }
 
 fn strip_surrounding_quotes(s: &str) -> &str {

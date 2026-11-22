@@ -38,6 +38,18 @@ impl EntityType {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HostAuthMode {
+    /// Use `credential_id` (or group default credential, falling back to SSH agent).
+    #[default]
+    Credential,
+    /// Authenticate directly with local OS SSH Agent (no Keychain record needed).
+    SshAgent,
+    /// Authenticate directly with Keyboard-Interactive / PAM / 2FA (no Keychain record needed).
+    KeyboardInteractive,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HostRecord {
     pub id: String,
@@ -53,6 +65,16 @@ pub struct HostRecord {
     pub keepalive_secs: u32,
     pub startup_command: Option<String>,
     pub notes: Option<String>,
+    #[serde(default)]
+    pub auth_mode: HostAuthMode,
+    #[serde(default)]
+    pub forward_agent: bool,
+    #[serde(default)]
+    pub proxy_url: Option<String>,
+    #[serde(default)]
+    pub favorite: bool,
+    #[serde(default)]
+    pub last_connected_at: Option<i64>,
     pub updated_at: i64,
 }
 
