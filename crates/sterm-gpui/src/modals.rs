@@ -1,12 +1,12 @@
 use core_ssh::types::HostKeyStatus;
-use core_vault::models::{CredentialKind, PortForwardKind};
+use core_vault::models::{CredentialKind, HostAuthMode, PortForwardKind};
 use gpui::{div, prelude::*, px, rgb, AnyElement, Context, Entity, FontWeight, MouseButton};
 
 use crate::app::{ActiveModal, ConfirmAction, StermAdminApp};
 use crate::local_shell::LocalShellManager;
 use crate::motion::animate_modal_enter;
 use crate::text_field::TextField;
-use crate::theme::{TerminalThemeId, ThemePalette};
+use crate::theme::{TerminalThemeId, ThemeMode, ThemePalette};
 
 impl StermAdminApp {
     pub fn render_modal(
@@ -77,6 +77,9 @@ impl StermAdminApp {
             ActiveModal::Confirm(action) => {
                 self.render_confirm_modal(t, action, cx).into_any_element()
             }
+            ActiveModal::ShortcutsHelp => {
+                self.render_shortcuts_help_modal(t, cx).into_any_element()
+            }
         };
 
         let animated_card = if self.settings.animations_enabled {
@@ -124,6 +127,14 @@ impl StermAdminApp {
         let q = query.to_lowercase();
         let quick_target = Self::parse_quick_target(&query);
 
+        let matched_tabs: Vec<_> = self
+            .workspace_tabs
+            .iter()
+            .filter(|tab| q.is_empty() || tab.title.to_lowercase().contains(&q))
+            .take(5)
+            .cloned()
+            .collect();
+
         let matched_hosts: Vec<_> = self
             .snapshot
             .hosts
@@ -136,6 +147,25 @@ impl StermAdminApp {
                     || h.tags.iter().any(|tag| tag.to_lowercase().contains(&q))
             })
             .take(8)
+            .cloned()
+            .collect();
+
+        let matched_tunnels: Vec<_> = self
+            .snapshot
+            .port_forwards
+            .iter()
+            .filter(|pf| {
+                q.is_empty()
+                    || pf.label.to_lowercase().contains(&q)
+                    || pf.bind_port.to_string().contains(&q)
+                    || pf
+                        .target_host
+                        .as_deref()
+                        .unwrap_or("")
+                        .to_lowercase()
+                        .contains(&q)
+            })
+            .take(5)
             .cloned()
             .collect();
 
@@ -157,9 +187,27 @@ impl StermAdminApp {
             .cloned()
             .collect();
 
+        let quick_actions: Vec<(&'static str, &'static str, &'static str)> = [
+            ("local_shell", "Open Local Shell", "Spawn default OS shell tab (PowerShell / zsh / bash)"),
+            ("new_host", "New Server Profile", "Add a new SSH host to your encrypted vault"),
+            ("new_tunnel", "New Port Forward Tunnel", "Create -L local, -R remote, or -D SOCKS5 tunnel"),
+            ("export_ssh", "Export ~/.ssh/config", "Save all vault hosts as an OpenSSH config file"),
+            ("sync_now", "Sync Vault Now", "Push & pull encrypted changes with sync server"),
+            ("toggle_theme", "Toggle Light / Dark Theme", "Switch between Light Studio and Dark Studio"),
+            ("shortcuts", "Keyboard Shortcuts", "View all workspace hotkeys (Ctrl+/)"),
+            ("lock_vault", "Lock Vault", "Clear decrypted vault key from memory (Ctrl+Shift+L)"),
+        ]
+        .into_iter()
+        .filter(|(_, title, desc)| {
+            q.is_empty()
+                || title.to_lowercase().contains(&q)
+                || desc.to_lowercase().contains(&q)
+        })
+        .collect();
+
         div()
-            .w(px(580.0))
-            .max_h(px(620.0))
+            .w(px(620.0))
+            .max_h(px(660.0))
             .rounded_2xl()
             .bg(t.bg_card)
             .border_1()
@@ -171,8 +219,8 @@ impl StermAdminApp {
             .gap_3()
             .child(self.modal_header(
                 t,
-                "Command Palette & Quick Connect",
-                "Search saved hosts, pinned snippets, or type user@host:port to connect immediately.",
+                "Command Omnibar & Quick Connect",
+                "Jump to hosts, open tabs, tunnels, snippets, actions, or type user@host:port.",
                 cx,
             ))
             .child(self.palette_query.clone())
@@ -284,17 +332,59 @@ impl StermAdminApp {
                         ),
                 )
             })
-            // Matching Hosts + Snippets scroll area
+            // Matching Open Tabs + Hosts + Tunnels + Snippets + Quick Actions scroll area
             .child(
                 div()
                     .id("palette-results-scroll")
-                    .max_h(px(360.0))
+                    .max_h(px(410.0))
                     .overflow_y_scroll()
                     .flex()
                     .flex_col()
                     .gap_2()
+                    .when(!matched_tabs.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .text_size(px(10.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(t.text_muted)
+                                .child(format!("OPEN WORKSPACE TABS ({})", matched_tabs.len())),
+                        )
+                        .children(matched_tabs.into_iter().enumerate().map(|(ix, ws)| {
+                            let wid = ws.id.clone();
+                            let active = self.active_workspace_tab_id.as_deref() == Some(ws.id.as_str());
+                            div()
+                                .id(("pal-tab", ix))
+                                .px_3()
+                                .py_1p5()
+                                .rounded_lg()
+                                .bg(if active { t.accent_soft } else { t.bg_subtle })
+                                .hover(|s| s.bg(t.bg_hover))
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .cursor_pointer()
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.modal = None;
+                                    this.select_workspace_tab(Some(wid.clone()), window, cx);
+                                }))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(if active { t.accent } else { t.text_primary })
+                                        .child(ws.title),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.0))
+                                        .text_color(t.text_muted)
+                                        .child("Switch ↵"),
+                                )
+                        }))
+                    })
                     .child(
                         div()
+                            .pt_1()
                             .text_size(px(10.0))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(t.text_muted)
@@ -390,6 +480,96 @@ impl StermAdminApp {
                                     ),
                             )
                     }))
+                    .when(!matched_tunnels.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .pt_2()
+                                .text_size(px(10.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(t.text_muted)
+                                .child(format!("PORT FORWARD TUNNELS ({})", matched_tunnels.len())),
+                        )
+                        .children(matched_tunnels.into_iter().enumerate().map(|(ix, pf)| {
+                            let running = self.active_tunnels.contains_key(&pf.id);
+                            let pf_click = pf.clone();
+                            let tid_stop = pf.id.clone();
+                            let lbl_stop = pf.label.clone();
+                            let spec = match pf.kind {
+                                PortForwardKind::Local => format!(
+                                    "-L {}:{} → {}:{}",
+                                    pf.bind_address,
+                                    pf.bind_port,
+                                    pf.target_host.as_deref().unwrap_or("127.0.0.1"),
+                                    pf.target_port.unwrap_or(80)
+                                ),
+                                PortForwardKind::Remote => format!(
+                                    "-R {}:{} ← {}:{}",
+                                    pf.bind_address,
+                                    pf.bind_port,
+                                    pf.target_host.as_deref().unwrap_or("127.0.0.1"),
+                                    pf.target_port.unwrap_or(80)
+                                ),
+                                PortForwardKind::DynamicSocks5 => {
+                                    format!("-D {}:{} (SOCKS5)", pf.bind_address, pf.bind_port)
+                                }
+                            };
+                            div()
+                                .id(("pal-tun", ix))
+                                .px_3()
+                                .py_1p5()
+                                .rounded_lg()
+                                .bg(t.bg_subtle)
+                                .hover(|s| s.bg(t.bg_hover))
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap_2()
+                                .cursor_pointer()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.modal = None;
+                                    if running {
+                                        this.stop_port_forward(
+                                            tid_stop.clone(),
+                                            lbl_stop.clone(),
+                                            cx,
+                                        );
+                                    } else {
+                                        this.start_port_forward(pf_click.clone(), cx);
+                                    }
+                                }))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .min_w_0()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(t.text_primary)
+                                                .child(pf.label),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(11.0))
+                                                .font_family("Consolas")
+                                                .text_color(t.text_muted)
+                                                .child(spec),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .px_2()
+                                        .py_0p5()
+                                        .rounded_md()
+                                        .text_size(px(11.0))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .bg(if running { t.danger_soft } else { t.success_soft })
+                                        .text_color(if running { t.danger } else { t.success })
+                                        .child(if running { "Stop" } else { "Start" }),
+                                )
+                        }))
+                    })
                     .when(!matched_snippets.is_empty(), |el| {
                         el.child(
                             div()
@@ -434,6 +614,87 @@ impl StermAdminApp {
                                     )
                                 })
                         }))
+                    })
+                    .when(!quick_actions.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .pt_2()
+                                .text_size(px(10.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(t.text_muted)
+                                .child("QUICK ACTIONS"),
+                        )
+                        .children(quick_actions.into_iter().enumerate().map(
+                            |(ix, (act_id, title, desc))| {
+                                div()
+                                    .id(("pal-act", ix))
+                                    .px_3()
+                                    .py_1p5()
+                                    .rounded_lg()
+                                    .bg(t.bg_subtle)
+                                    .hover(|s| s.bg(t.bg_hover))
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_2()
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.modal = None;
+                                        match act_id {
+                                            "local_shell" => {
+                                                this.open_local_shell(
+                                                    None,
+                                                    None,
+                                                    Some(window),
+                                                    cx,
+                                                );
+                                            }
+                                            "new_host" => this.open_add_host_modal(None, cx),
+                                            "new_tunnel" => this.open_tunnel_editor(None, cx),
+                                            "export_ssh" => this.export_ssh_config_dialog(cx),
+                                            "sync_now" => this.trigger_sync_now(cx),
+                                            "toggle_theme" => {
+                                                this.settings.theme_mode =
+                                                    match this.settings.theme_mode {
+                                                        ThemeMode::Light => ThemeMode::Dark,
+                                                        ThemeMode::Dark => ThemeMode::Light,
+                                                    };
+                                                this.save_settings(cx);
+                                            }
+                                            "shortcuts" => {
+                                                this.open_modal(ActiveModal::ShortcutsHelp, cx);
+                                            }
+                                            "lock_vault" => this.lock_vault(cx),
+                                            _ => {}
+                                        }
+                                    }))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .min_w_0()
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(t.text_primary)
+                                                    .child(title),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(11.0))
+                                                    .text_color(t.text_muted)
+                                                    .child(desc),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(11.0))
+                                            .text_color(t.accent)
+                                            .child("Run ↵"),
+                                    )
+                            },
+                        ))
                     }),
             )
     }
@@ -672,14 +933,43 @@ impl StermAdminApp {
                                         })
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.qc_auth_choice = k_set.clone();
+                                            this.qc_auth_mode = match k_set {
+                                                CredentialKind::SshAgent => {
+                                                    this.selected_credential_id = None;
+                                                    HostAuthMode::SshAgent
+                                                }
+                                                CredentialKind::KeyboardInteractive => {
+                                                    this.selected_credential_id = None;
+                                                    HostAuthMode::KeyboardInteractive
+                                                }
+                                                _ => HostAuthMode::Credential,
+                                            };
                                             cx.notify();
                                         }))
                                         .child(lbl)
                                 }),
                             )),
                     )
+                    .when(self.qc_auth_mode != HostAuthMode::Credential, |el| {
+                        el.child(
+                            div()
+                                .p_2p5()
+                                .rounded_lg()
+                                .bg(t.bg_subtle)
+                                .text_xs()
+                                .text_color(t.text_muted)
+                                .child(if self.qc_auth_mode == HostAuthMode::SshAgent {
+                                    "Authenticates directly via your local OS SSH Agent (stored on the host profile — no Keychain secret needed)."
+                                } else {
+                                    "Authenticates via interactive PAM / 2FA OTP prompts at connect time (stored directly on the host profile)."
+                                }),
+                        )
+                    })
                     // Saved Keychain Credential Picker (reuse existing credentials!)
-                    .when(!self.snapshot.credentials.is_empty(), |el| {
+                    .when(
+                        self.qc_auth_mode == HostAuthMode::Credential
+                            && !self.snapshot.credentials.is_empty(),
+                        |el| {
                         el.child(
                             div()
                                 .flex()
@@ -756,6 +1046,8 @@ impl StermAdminApp {
                                                     .on_click(cx.listener(move |this, _, _, cx| {
                                                         this.selected_credential_id =
                                                             Some(cid.clone());
+                                                        this.qc_auth_mode =
+                                                            HostAuthMode::Credential;
                                                         this.qc_auth_choice = ckind.clone();
                                                         cx.notify();
                                                     }))
@@ -1043,6 +1335,86 @@ impl StermAdminApp {
                                     )),
                             ),
                     )
+                    // Proxy URL (SOCKS5 / HTTP CONNECT) + ForwardAgent (-A) + Favorite toggles
+                    .child(self.labeled_field(
+                        t,
+                        "Proxy URL (optional: socks5://user:pass@host:1080 or http://host:8080)",
+                        self.qc_proxy_url.clone(),
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("he-fwd-agent")
+                                    .px_3()
+                                    .py_1p5()
+                                    .rounded_lg()
+                                    .border_1()
+                                    .text_xs()
+                                    .cursor_pointer()
+                                    .bg(if self.qc_forward_agent {
+                                        t.accent_soft
+                                    } else {
+                                        t.bg_subtle
+                                    })
+                                    .border_color(if self.qc_forward_agent {
+                                        t.accent
+                                    } else {
+                                        t.border
+                                    })
+                                    .text_color(if self.qc_forward_agent {
+                                        t.accent
+                                    } else {
+                                        t.text_secondary
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.qc_forward_agent = !this.qc_forward_agent;
+                                        cx.notify();
+                                    }))
+                                    .child(if self.qc_forward_agent {
+                                        "✓ Forward SSH Agent (-A)"
+                                    } else {
+                                        "Forward SSH Agent (-A)"
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .id("he-favorite")
+                                    .px_3()
+                                    .py_1p5()
+                                    .rounded_lg()
+                                    .border_1()
+                                    .text_xs()
+                                    .cursor_pointer()
+                                    .bg(if self.qc_favorite {
+                                        t.accent_soft
+                                    } else {
+                                        t.bg_subtle
+                                    })
+                                    .border_color(if self.qc_favorite {
+                                        t.accent
+                                    } else {
+                                        t.border
+                                    })
+                                    .text_color(if self.qc_favorite {
+                                        t.accent
+                                    } else {
+                                        t.text_secondary
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.qc_favorite = !this.qc_favorite;
+                                        cx.notify();
+                                    }))
+                                    .child(if self.qc_favorite {
+                                        "★ Pinned to Favorites"
+                                    } else {
+                                        "☆ Pin to Favorites"
+                                    }),
+                            ),
+                    )
                     // Metadata: Tags, Keepalive, Startup Command, Notes
                     .child(
                         div()
@@ -1133,6 +1505,97 @@ impl StermAdminApp {
                 cx,
             ))
             .child(self.labeled_field(t, "Group Name", self.grp_name_input.clone()))
+            // Nested Parent Group Selector
+            .when(
+                self.snapshot
+                    .groups
+                    .iter()
+                    .any(|g| editing_id.as_deref() != Some(g.id.as_str())),
+                |el| {
+                    let parent_candidates: Vec<_> = self
+                        .snapshot
+                        .groups
+                        .iter()
+                        .filter(|g| editing_id.as_deref() != Some(g.id.as_str()))
+                        .cloned()
+                        .collect();
+                    el.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(t.text_secondary)
+                                    .child("Parent Group (Nested Hierarchy)"),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .gap_1p5()
+                                    .child(
+                                        div()
+                                            .id("grp-parent-none")
+                                            .px_2()
+                                            .py_1()
+                                            .rounded_md()
+                                            .border_1()
+                                            .text_size(px(11.0))
+                                            .cursor_pointer()
+                                            .bg(if self.grp_parent_id.is_none() {
+                                                t.accent_soft
+                                            } else {
+                                                t.bg_subtle
+                                            })
+                                            .border_color(if self.grp_parent_id.is_none() {
+                                                t.accent
+                                            } else {
+                                                t.border
+                                            })
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.grp_parent_id = None;
+                                                cx.notify();
+                                            }))
+                                            .child("Top-Level"),
+                                    )
+                                    .children(parent_candidates.into_iter().enumerate().map(
+                                        |(ix, pg)| {
+                                            let pid = pg.id.clone();
+                                            let active = self.grp_parent_id.as_deref()
+                                                == Some(pg.id.as_str());
+                                            let path_lbl = self.group_display_path(&pg.id);
+                                            div()
+                                                .id(("grp-parent", ix))
+                                                .px_2()
+                                                .py_1()
+                                                .rounded_md()
+                                                .border_1()
+                                                .text_size(px(11.0))
+                                                .cursor_pointer()
+                                                .bg(if active {
+                                                    t.accent_soft
+                                                } else {
+                                                    t.bg_subtle
+                                                })
+                                                .border_color(if active {
+                                                    t.accent
+                                                } else {
+                                                    t.border
+                                                })
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.grp_parent_id = Some(pid.clone());
+                                                    cx.notify();
+                                                }))
+                                                .child(path_lbl)
+                                        },
+                                    )),
+                            ),
+                    )
+                },
+            )
             .child(self.labeled_field(
                 t,
                 "Default Username (optional)",
@@ -2587,6 +3050,65 @@ impl StermAdminApp {
             })
             .child(
                 div()
+                    .id("tun-autostart-toggle")
+                    .px_3()
+                    .py_2()
+                    .rounded_lg()
+                    .border_1()
+                    .bg(if self.tun_auto_start {
+                        t.accent_soft
+                    } else {
+                        t.bg_subtle
+                    })
+                    .border_color(if self.tun_auto_start {
+                        t.accent
+                    } else {
+                        t.border
+                    })
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.tun_auto_start = !this.tun_auto_start;
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(if self.tun_auto_start {
+                                        t.accent
+                                    } else {
+                                        t.text_primary
+                                    })
+                                    .child("Auto-start tunnel when SSH host connects"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(t.text_muted)
+                                    .child("Automatically binds this port forward whenever you open a terminal to the selected host."),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(if self.tun_auto_start {
+                                t.accent
+                            } else {
+                                t.text_muted
+                            })
+                            .child(if self.tun_auto_start { "ON" } else { "OFF" }),
+                    ),
+            )
+            .child(
+                div()
                     .flex()
                     .justify_end()
                     .gap_2()
@@ -2775,6 +3297,88 @@ impl StermAdminApp {
                             }))
                             .child("▶ Run Command"),
                     ),
+            )
+    }
+
+    fn render_shortcuts_help_modal(
+        &self,
+        t: &ThemePalette,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let rows: [(&str, &str); 12] = [
+            ("Ctrl / Cmd + K", "Open Command Omnibar & Quick Connect"),
+            ("Ctrl / Cmd + 1", "Switch to Vault Home tab"),
+            ("Ctrl / Cmd + 2..9", "Jump directly to open workspace tab #1..#8"),
+            ("Ctrl / Cmd + D", "Split active terminal horizontally (side-by-side)"),
+            ("Ctrl / Cmd + Shift + D", "Split active terminal vertically (top/bottom)"),
+            ("Ctrl / Cmd + F", "Toggle scrollback search in active terminal"),
+            ("Ctrl / Cmd + Space", "Toggle inline command suggestions & snippets"),
+            ("Ctrl / Cmd + W", "Close current workspace tab"),
+            ("Ctrl / Cmd + Shift + L", "Lock encrypted vault immediately"),
+            ("Ctrl / Cmd + C / V", "Copy selection / paste in terminal"),
+            ("Shift + PgUp / PgDn", "Scroll terminal scrollback buffer"),
+            ("Ctrl / Cmd + /", "Open this Keyboard Shortcuts Cheat Sheet"),
+        ];
+
+        div()
+            .w(px(560.0))
+            .rounded_2xl()
+            .bg(t.bg_card)
+            .border_1()
+            .border_color(t.border_strong)
+            .shadow_2xl()
+            .p_5()
+            .flex()
+            .flex_col()
+            .gap_3p5()
+            .child(self.modal_header(
+                t,
+                "Keyboard Shortcuts",
+                "Power-user navigation across Vault, Terminal panes, and SFTP.",
+                cx,
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1p5()
+                    .children(rows.into_iter().map(|(keys, desc)| {
+                        div()
+                            .px_3()
+                            .py_1p5()
+                            .rounded_lg()
+                            .bg(t.bg_subtle)
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(t.text_primary)
+                                    .child(desc),
+                            )
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py_0p5()
+                                    .rounded_md()
+                                    .bg(t.bg_card)
+                                    .border_1()
+                                    .border_color(t.border_strong)
+                                    .font_family("Consolas")
+                                    .text_size(px(11.0))
+                                    .text_color(t.accent)
+                                    .whitespace_nowrap()
+                                    .child(keys),
+                            )
+                    })),
+            )
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .child(self.cancel_modal_btn(t, cx)),
             )
     }
 

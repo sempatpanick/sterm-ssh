@@ -159,6 +159,8 @@ pub struct UiSettings {
     pub auto_sync: bool,
     pub auto_reconnect: bool,
     pub auto_lock_minutes: u32,
+    pub host_view_grid: bool,
+    pub biometric_unlock: bool,
 }
 
 impl Default for UiSettings {
@@ -177,6 +179,8 @@ impl Default for UiSettings {
             auto_sync: true,
             auto_reconnect: true,
             auto_lock_minutes: 0,
+            host_view_grid: false,
+            biometric_unlock: false,
         }
     }
 }

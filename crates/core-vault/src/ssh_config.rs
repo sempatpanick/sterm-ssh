@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use ssh_key::{HashAlg, PublicKey};
 
 use crate::{
-    models::{CredentialKind, CredentialRecord, HostRecord},
+    models::{CredentialKind, CredentialRecord, GroupRecord, HostRecord},
     store::VaultStore,
     VaultResult,
 };
@@ -445,6 +445,11 @@ fn import_parsed_hosts_with_dir(
             keepalive_secs: 30,
             startup_command: None,
             notes: Some("Imported from ~/.ssh/config".to_string()),
+            auth_mode: Default::default(),
+            forward_agent: entry.forward_agent,
+            proxy_url: None,
+            favorite: false,
+            last_connected_at: None,
             updated_at: 0,
         })?;
 
@@ -692,6 +697,79 @@ pub fn sync_local_ssh_dir(
     Ok(total)
 }
 
+/// Exports vault hosts into a clean, standards-compliant OpenSSH `~/.ssh/config` file.
+pub fn export_hosts_to_ssh_config(hosts: &[HostRecord], groups: &[GroupRecord]) -> String {
+    let mut out = String::from("# Exported by STerm SSH\n\n");
+    let sanitize_alias = |label: &str| -> String {
+        let s: String = label
+            .trim()
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        if s.is_empty() {
+            "host".to_string()
+        } else {
+            s
+        }
+    };
+
+    let id_to_alias: HashMap<&str, String> = hosts
+        .iter()
+        .map(|h| (h.id.as_str(), sanitize_alias(&h.label)))
+        .collect();
+    let group_names: HashMap<&str, &str> = groups
+        .iter()
+        .map(|g| (g.id.as_str(), g.name.as_str()))
+        .collect();
+
+    for h in hosts {
+        let alias = sanitize_alias(&h.label);
+        let mut meta = Vec::new();
+        if let Some(gname) = h
+            .group_id
+            .as_deref()
+            .and_then(|gid| group_names.get(gid))
+        {
+            meta.push(format!("group:{gname}"));
+        }
+        if !h.tags.is_empty() {
+            meta.push(format!("tags:{}", h.tags.join(",")));
+        }
+        if !meta.is_empty() {
+            out.push_str(&format!("# {} ({})\n", h.label, meta.join(" · ")));
+        }
+        out.push_str(&format!("Host {alias}\n"));
+        out.push_str(&format!("    HostName {}\n", h.hostname));
+        if h.port != 22 {
+            out.push_str(&format!("    Port {}\n", h.port));
+        }
+        if !h.username.is_empty() {
+            out.push_str(&format!("    User {}\n", h.username));
+        }
+        if let Some(jump_alias) = h
+            .jump_host_id
+            .as_deref()
+            .and_then(|jid| id_to_alias.get(jid))
+        {
+            out.push_str(&format!("    ProxyJump {jump_alias}\n"));
+        }
+        if h.forward_agent {
+            out.push_str("    ForwardAgent yes\n");
+        }
+        if h.keepalive_secs > 0 {
+            out.push_str(&format!("    ServerAliveInterval {}\n", h.keepalive_secs));
+        }
+        out.push('\n');
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -735,6 +813,12 @@ mod tests {
         let bastion = stored.iter().find(|h| h.label == "bastion").unwrap();
         let app1 = stored.iter().find(|h| h.label == "app-1").unwrap();
         assert_eq!(app1.jump_host_id.as_deref(), Some(bastion.id.as_str()));
+        assert!(bastion.forward_agent);
+
+        let exported = export_hosts_to_ssh_config(&stored, &[]);
+        assert!(exported.contains("Host bastion"));
+        assert!(exported.contains("ForwardAgent yes"));
+        assert!(exported.contains("ProxyJump bastion"));
     }
 
     #[test]

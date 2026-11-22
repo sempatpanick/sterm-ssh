@@ -17,8 +17,8 @@ use core_sftp::{
 use core_ssh::{
     manager::{HostKeyVerifier, SshSessionManager},
     types::{
-        ConnectRequest, HostKeyChallenge, KeyboardInteractiveChallenge, SshAuthMethod, SshTarget,
-        TerminalEvent, TunnelStats,
+        AgentIdentityInfo, ConnectRequest, HostKeyChallenge, KeyboardInteractiveChallenge,
+        SshAuthMethod, SshTarget, TerminalEvent, TunnelStats,
     },
 };
 use core_sync::{
@@ -30,7 +30,7 @@ use core_sync::{
     },
 };
 use core_vault::{
-    models::{CredentialKind, CredentialRecord, HostRecord, KnownHostRecord},
+    models::{CredentialKind, CredentialRecord, HostAuthMode, HostRecord, KnownHostRecord},
     ssh_config::LocalSshDiscovery,
     store::VaultStore,
 };
@@ -138,6 +138,20 @@ pub enum UiEvent {
         attempt: u32,
     },
     IdleLockTick,
+    HostLatencies(Vec<(String, Option<u64>)>),
+    AgentIdentitiesLoaded(Result<Vec<AgentIdentityInfo>, String>),
+    SftpLeftRemoteConnected {
+        session_id: String,
+        host_id: String,
+        host_label: String,
+        remote_cwd: String,
+    },
+    SftpLeftRemoteListed {
+        session_id: String,
+        path: String,
+        entries: Vec<FileEntry>,
+    },
+    BiometricUnlockResult(Result<bool, String>),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -195,7 +209,15 @@ impl BackendServices {
         let db_path = data_dir.join("sterm-vault.db");
 
         let mut vault = VaultStore::open(&db_path).expect("failed to open encrypted vault db");
-        let _ = vault.try_unlock_from_os_keychain();
+        let require_biometric = vault
+            .get_meta_string("gpui_settings")
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str::<crate::theme::UiSettings>(&s).ok())
+            .is_some_and(|cfg| cfg.biometric_unlock);
+        if !require_biometric {
+            let _ = vault.try_unlock_from_os_keychain();
+        }
 
         // Only attach a saved OS Keychain sync session if it belongs to this vault's account_id
         // so we never pull ciphertexts encrypted with a different vault DEK.
@@ -392,6 +414,10 @@ fn resolve_target(
 
     let auth = if let Some(pw) = override_password.filter(|s| !s.is_empty()) {
         SshAuthMethod::Password { password: pw }
+    } else if host.auth_mode == HostAuthMode::SshAgent {
+        SshAuthMethod::SshAgent
+    } else if host.auth_mode == HostAuthMode::KeyboardInteractive {
+        SshAuthMethod::KeyboardInteractive
     } else if let Some(ref cred_id) = effective_cred_id {
         let cred = vault.get_credential(cred_id).map_err(|e| e.to_string())?;
         match cred.kind {
@@ -419,7 +445,7 @@ fn resolve_target(
             CredentialKind::KeyboardInteractive => SshAuthMethod::KeyboardInteractive,
         }
     } else {
-        SshAuthMethod::None
+        SshAuthMethod::SshAgent
     };
 
     Ok(SshTarget {
@@ -428,6 +454,8 @@ fn resolve_target(
         username: effective_username,
         auth,
         keepalive_secs: host.keepalive_secs,
+        forward_agent: host.forward_agent,
+        proxy_url: host.proxy_url.clone(),
     })
 }
 
@@ -945,6 +973,113 @@ pub fn build_ssh_copy_id_command(public_key: &str) -> String {
     format!(
         "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && (grep -qxF '{escaped}' ~/.ssh/authorized_keys || printf '%s\\n' '{escaped}' >> ~/.ssh/authorized_keys)"
     )
+}
+
+/// Prompts the OS native biometric / user-presence verifier (Windows Hello on Windows,
+/// Touch ID / LocalAuthentication on macOS) before releasing the OS Keychain vault key.
+pub fn verify_os_biometric(reason: &str) -> Result<bool, String> {
+    #[cfg(windows)]
+    {
+        let safe_reason = reason.replace('\'', "''");
+        let ps_script = format!(
+            "Add-Type -AssemblyName System.Runtime.WindowsRuntime; \
+             $asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {{ $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' }})[0]; \
+             Function Await($op, $resType) {{ $t = $asTaskGeneric.MakeGenericMethod($resType).Invoke($null, @($op)); $t.Wait(); $t.Result }}; \
+             [Windows.Security.Credentials.UI.UserConsentVerifier,Windows.Security.Credentials.UI,ContentType=WindowsRuntime] | Out-Null; \
+             $res = Await ([Windows.Security.Credentials.UI.UserConsentVerifier]::RequestVerificationAsync('{safe_reason}')) ([Windows.Security.Credentials.UI.UserConsentVerificationResult]); \
+             Write-Output $res"
+        );
+        let out = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &ps_script])
+            .output()
+            .map_err(|e| format!("Windows Hello invocation failed: {e}"))?;
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if stdout.contains("Verified") {
+            Ok(true)
+        } else if stdout.contains("Canceled") {
+            Ok(false)
+        } else {
+            Err(format!("Windows Hello unavailable or declined ({stdout})"))
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let safe_reason = reason.replace('"', "\\\"");
+        let swift_code = format!(
+            "import LocalAuthentication; import Foundation; \
+             let ctx = LAContext(); var err: NSError?; \
+             if ctx.canEvaluatePolicy(.deviceOwnerAuthentication, error: &err) {{ \
+               let sem = DispatchSemaphore(value: 0); var ok = false; \
+               ctx.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: \"{safe_reason}\") {{ s, _ in ok = s; sem.signal() }}; \
+               sem.wait(); print(ok ? \"VERIFIED\" : \"DECLINED\") \
+             }} else {{ print(\"UNAVAILABLE\") }}"
+        );
+        let out = std::process::Command::new("swift")
+            .args(["-e", &swift_code])
+            .output()
+            .map_err(|e| format!("macOS Touch ID check failed: {e}"))?;
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if stdout.contains("VERIFIED") {
+            Ok(true)
+        } else if stdout.contains("DECLINED") {
+            Ok(false)
+        } else {
+            Err("Touch ID / macOS LocalAuthentication unavailable.".into())
+        }
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = reason;
+        Err("Biometric unlock is supported on Windows Hello and macOS Touch ID.".into())
+    }
+}
+
+/// Launches `path` in the user's configured external editor (`$VISUAL` / `$EDITOR` / VS Code / OS default).
+pub fn open_file_in_external_editor(path: &std::path::Path) -> Result<(), String> {
+    if let Ok(ed) = std::env::var("VISUAL").or_else(|_| std::env::var("EDITOR"))
+        && !ed.trim().is_empty()
+    {
+        let mut parts = ed.split_whitespace();
+        if let Some(prog) = parts.next() {
+            let mut cmd = std::process::Command::new(prog);
+            for arg in parts {
+                cmd.arg(arg);
+            }
+            cmd.arg(path);
+            if cmd.spawn().is_ok() {
+                return Ok(());
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", &path.to_string_lossy()])
+            .spawn()
+            .map_err(|e| format!("Failed to open external editor: {e}"))?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(path)
+            .spawn()
+            .map_err(|e| format!("Failed to open external editor: {e}"))?;
+        Ok(())
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(path)
+            .spawn()
+            .map_err(|e| format!("Failed to open external editor: {e}"))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

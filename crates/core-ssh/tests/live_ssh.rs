@@ -355,6 +355,8 @@ async fn live_ssh_password_pubkey_pty_resize_and_tofu() {
                         password: test_pw,
                     },
                     keepalive_secs: 0,
+                    forward_agent: false,
+                    proxy_url: None,
                 },
                 cols: 80,
                 rows: 24,
@@ -381,6 +383,8 @@ async fn live_ssh_password_pubkey_pty_resize_and_tofu() {
                         passphrase: None,
                     },
                     keepalive_secs: 0,
+                    forward_agent: false,
+                    proxy_url: None,
                 },
                 cols: 100,
                 rows: 30,
@@ -467,6 +471,8 @@ async fn live_ssh_certificate_and_keyboard_interactive_auth() {
                         certificate: cert_openssh,
                     },
                     keepalive_secs: 0,
+                    forward_agent: false,
+                    proxy_url: None,
                 },
                 cols: 80,
                 rows: 24,
@@ -490,6 +496,8 @@ async fn live_ssh_certificate_and_keyboard_interactive_auth() {
                     username: "tester".into(),
                     auth: SshAuthMethod::KeyboardInteractive,
                     keepalive_secs: 0,
+                    forward_agent: false,
+                    proxy_url: None,
                 },
                 cols: 80,
                 rows: 24,
@@ -521,6 +529,8 @@ async fn live_ssh_rekey_and_keepalive_stays_connected() {
                     username: "tester".into(),
                     auth: SshAuthMethod::Password { password: test_pw },
                     keepalive_secs: 1,
+                    forward_agent: false,
+                    proxy_url: None,
                 },
                 cols: 80,
                 rows: 24,
@@ -611,6 +621,8 @@ async fn live_ssh_local_and_socks5_port_forwarding_and_exec() {
                 password: test_pw.clone(),
             },
             keepalive_secs: 0,
+            forward_agent: false,
+            proxy_url: None,
         },
         cols: 80,
         rows: 24,
@@ -681,6 +693,32 @@ async fn live_ssh_local_and_socks5_port_forwarding_and_exec() {
         let n = client.read(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"TUNNELED:ping-socks");
     }
+
+    // 4. Connect a second SSH exec_command THROUGH our live SOCKS5 proxy (-D) + probe latency
+    let proxied_req = ConnectRequest {
+        jump_chain: vec![],
+        target: SshTarget {
+            hostname: "127.0.0.1".into(),
+            port: ssh_port,
+            username: "tester".into(),
+            auth: SshAuthMethod::Password {
+                password: test_pw.clone(),
+            },
+            keepalive_secs: 0,
+            forward_agent: false,
+            proxy_url: Some(format!("socks5://127.0.0.1:{socks_port}")),
+        },
+        cols: 80,
+        rows: 24,
+        startup_command: None,
+    };
+    let (pcode, pout) = mgr
+        .exec_command(proxied_req, Arc::new(AcceptAllHostKeys), "via-socks")
+        .await
+        .expect("exec_command through SOCKS5 proxy");
+    assert_eq!(pcode, 0);
+    assert!(pout.contains("EXEC_OK:via-socks"));
+    assert!(SshSessionManager::probe_tcp_latency("127.0.0.1", ssh_port, 1000).await.is_some());
 
     assert_eq!(mgr.list_tunnels().len(), 2);
     mgr.stop_tunnel("tun-local").await.unwrap();

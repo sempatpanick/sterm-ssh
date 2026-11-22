@@ -105,6 +105,11 @@ mod tests {
                 keepalive_secs: 30,
                 startup_command: None,
                 notes: Some("cluster-note-fixture".into()),
+                auth_mode: Default::default(),
+                forward_agent: false,
+                proxy_url: None,
+                favorite: false,
+                last_connected_at: None,
                 updated_at: 0,
             })
             .unwrap();

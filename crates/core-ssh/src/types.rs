@@ -27,6 +27,16 @@ pub struct SshTarget {
     pub username: String,
     pub auth: SshAuthMethod,
     pub keepalive_secs: u32,
+    pub forward_agent: bool,
+    pub proxy_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentIdentityInfo {
+    pub comment: String,
+    pub algorithm: String,
+    pub fingerprint_sha256: String,
+    pub is_certificate: bool,
 }
 
 #[derive(Debug, Clone)]
