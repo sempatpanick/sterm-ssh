@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use core_sftp::types::{FileEntry, TransferDirection, TransferProgress, TransferStatus};
@@ -102,6 +103,8 @@ pub struct SftpWorkspaceState {
     pub remote_scroll_handle: UniformListScrollHandle,
     pub selected_local: Option<String>,
     pub selected_remote: Option<String>,
+    pub selected_local_paths: HashSet<String>,
+    pub selected_remote_paths: HashSet<String>,
     pub connecting: bool,
     pub loading_local: bool,
     pub loading_remote: bool,
@@ -123,6 +126,8 @@ impl SftpWorkspaceState {
             remote_scroll_handle: UniformListScrollHandle::new(),
             selected_local: None,
             selected_remote: None,
+            selected_local_paths: HashSet::new(),
+            selected_remote_paths: HashSet::new(),
             connecting: false,
             loading_local: false,
             loading_remote: false,
@@ -146,6 +151,18 @@ impl SftpWorkspaceState {
             .filter(|(_, e)| self.show_hidden || !e.name.starts_with('.'))
             .map(|(i, _)| i)
             .collect()
+    }
+
+    pub fn toggle_local_select(&mut self, path: String) {
+        if !self.selected_local_paths.remove(&path) {
+            self.selected_local_paths.insert(path);
+        }
+    }
+
+    pub fn toggle_remote_select(&mut self, path: String) {
+        if !self.selected_remote_paths.remove(&path) {
+            self.selected_remote_paths.insert(path);
+        }
     }
 
     pub fn clear_finished_transfers(&mut self) {

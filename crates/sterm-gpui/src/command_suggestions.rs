@@ -210,6 +210,42 @@ pub fn compute_insert_payload(
     }
 }
 
+/// Extracts deduplicated `{{variable}}` placeholder names in order of first appearance.
+pub fn extract_template_vars(cmd: &str) -> Vec<String> {
+    let mut vars = Vec::new();
+    let mut rest = cmd;
+    while let Some(open) = rest.find("{{") {
+        let after_open = &rest[open + 2..];
+        let Some(close) = after_open.find("}}") else {
+            break;
+        };
+        let name = after_open[..close].trim();
+        if name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            && !vars.iter().any(|existing: &String| existing == name)
+        {
+            vars.push(name.to_string());
+        }
+        rest = &after_open[close + 2..];
+    }
+    vars
+}
+
+/// Replaces all `{{var}}` occurrences with the provided `(name, value)` pairs.
+pub fn render_template(cmd: &str, values: &[(String, String)]) -> String {
+    let mut out = cmd.to_string();
+    for (name, val) in values {
+        let token = format!("{{{{{name}}}}}");
+        out = out.replace(&token, val);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,14 +299,36 @@ mod tests {
 
     #[test]
     fn rejects_private_and_password_prompt_commands() {
-        assert!(!should_record_command(" secret-token-cmd", "user@host:~$ "));
+        assert!(!should_record_command(" leading-space-cmd", "user@host:~$ "));
         assert!(!should_record_command(
-            "my-secret-pass",
+            "ephemeral-input-val",
             "[sudo] password for ops: "
         ));
         assert!(should_record_command(
             "systemctl restart nginx",
             "ops@prod:~$ "
         ));
+    }
+
+    #[test]
+    fn extracts_and_renders_snippet_template_variables() {
+        let tpl = "kubectl -n {{namespace}} logs -f deploy/{{service}} --tail={{lines}} && echo {{namespace}}";
+        let vars = extract_template_vars(tpl);
+        assert_eq!(vars, vec!["namespace", "service", "lines"]);
+
+        let rendered = render_template(
+            tpl,
+            &[
+                ("namespace".into(), "prod".into()),
+                ("service".into(), "api".into()),
+                ("lines".into(), "200".into()),
+            ],
+        );
+        assert_eq!(
+            rendered,
+            "kubectl -n prod logs -f deploy/api --tail=200 && echo prod"
+        );
+        // Go template syntax like {{.Names}} is NOT treated as a prompt variable
+        assert!(extract_template_vars("docker ps --format '{{.Names}}'").is_empty());
     }
 }

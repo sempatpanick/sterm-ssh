@@ -1,10 +1,15 @@
+use std::net::{Ipv4Addr, Ipv6Addr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use dashmap::DashMap;
-use russh::client::{self, DisconnectReason, Handle, KeyboardInteractiveAuthResponse};
+use russh::client::{
+    self, ChannelOpenHandle, DisconnectReason, Handle, KeyboardInteractiveAuthResponse, Msg,
+    Session,
+};
 use russh::keys::{
     agent::{
         client::{AgentClient, AgentStream},
@@ -14,15 +19,18 @@ use russh::keys::{
     key::PrivateKeyWithHashAlg,
     Certificate, HashAlg, PublicKeyBase64, PublicKeyOrCertificate,
 };
-use russh::{ChannelMsg, ChannelStream};
+use russh::{Channel, ChannelMsg, ChannelStream};
 use socket2::{SockRef, TcpKeepalive};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::types::{
     ConnectRequest, HostKeyChallenge, HostKeyStatus, KeyboardInteractiveChallenge,
-    KeyboardInteractivePrompt, SshAuthMethod, SshTarget, TerminalEvent,
+    KeyboardInteractivePrompt, SshAuthMethod, SshTarget, TerminalEvent, TunnelKind, TunnelStats,
 };
 use crate::{SshError, SshResult};
 
@@ -62,11 +70,38 @@ impl HostKeyVerifier for AcceptAllHostKeys {
     async fn save_known_host(&self, _challenge: HostKeyChallenge) {}
 }
 
+#[derive(Clone)]
+struct TunnelCounters {
+    active_connections: Arc<AtomicU64>,
+    bytes_tx: Arc<AtomicU64>,
+    bytes_rx: Arc<AtomicU64>,
+}
+
+impl TunnelCounters {
+    fn new() -> Self {
+        Self {
+            active_connections: Arc::new(AtomicU64::new(0)),
+            bytes_tx: Arc::new(AtomicU64::new(0)),
+            bytes_rx: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RemoteForwardEntry {
+    target_host: String,
+    target_port: u16,
+    counters: TunnelCounters,
+}
+
+type RemoteForwardMap = Arc<DashMap<u32, RemoteForwardEntry>>;
+
 struct StermClientHandler {
     hostname: String,
     port: u16,
     verifier: Arc<dyn HostKeyVerifier>,
     disconnect_reason: Arc<Mutex<Option<String>>>,
+    remote_forwards: RemoteForwardMap,
 }
 
 impl client::Handler for StermClientHandler {
@@ -123,6 +158,53 @@ impl client::Handler for StermClientHandler {
         Ok(accepted)
     }
 
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: Channel<Msg>,
+        _connected_address: &str,
+        connected_port: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: ChannelOpenHandle,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let Some(entry) = self
+            .remote_forwards
+            .get(&connected_port)
+            .map(|r| r.value().clone())
+        else {
+            reply
+                .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            return Ok(());
+        };
+        reply.accept().await;
+        tokio::spawn(async move {
+            let addr = format!("{}:{}", entry.target_host, entry.target_port);
+            let Ok(mut local) = TcpStream::connect(&addr).await else {
+                warn!("Remote forward failed to reach local target {addr}");
+                return;
+            };
+            let _ = local.set_nodelay(true);
+            entry
+                .counters
+                .active_connections
+                .fetch_add(1, Ordering::Relaxed);
+            let mut ssh_stream = channel.into_stream();
+            if let Ok((from_ssh, to_ssh)) =
+                tokio::io::copy_bidirectional(&mut ssh_stream, &mut local).await
+            {
+                entry.counters.bytes_rx.fetch_add(from_ssh, Ordering::Relaxed);
+                entry.counters.bytes_tx.fetch_add(to_ssh, Ordering::Relaxed);
+            }
+            entry
+                .counters
+                .active_connections
+                .fetch_sub(1, Ordering::Relaxed);
+        });
+        Ok(())
+    }
+
     async fn disconnected(
         &mut self,
         reason: DisconnectReason<Self::Error>,
@@ -163,10 +245,24 @@ struct ActiveSession {
     /// Keep jump host handles alive for the lifetime of the tunneled session.
     _jump_handles: Vec<Handle<StermClientHandler>>,
     shell_tx: Option<mpsc::Sender<ShellControl>>,
+    remote_forwards: RemoteForwardMap,
+}
+
+struct ActiveTunnel {
+    tunnel_id: String,
+    session_id: String,
+    kind: TunnelKind,
+    bind_address: String,
+    bind_port: u16,
+    target_host: Option<String>,
+    target_port: Option<u16>,
+    cancel: CancellationToken,
+    counters: TunnelCounters,
 }
 
 pub struct SshSessionManager {
     sessions: Arc<DashMap<String, ActiveSession>>,
+    tunnels: Arc<DashMap<String, ActiveTunnel>>,
     pending_challenges: DashMap<String, oneshot::Sender<bool>>,
     pending_kbi_challenges: DashMap<String, oneshot::Sender<Option<Vec<String>>>>,
 }
@@ -181,6 +277,7 @@ impl SshSessionManager {
     pub fn new() -> Self {
         Self {
             sessions: Arc::new(DashMap::new()),
+            tunnels: Arc::new(DashMap::new()),
             pending_challenges: DashMap::new(),
             pending_kbi_challenges: DashMap::new(),
         }
@@ -244,7 +341,11 @@ impl SshSessionManager {
         target: &SshTarget,
         verifier: Arc<dyn HostKeyVerifier>,
         tunnel: Option<&Handle<StermClientHandler>>,
-    ) -> SshResult<(Handle<StermClientHandler>, Arc<Mutex<Option<String>>>)> {
+    ) -> SshResult<(
+        Handle<StermClientHandler>,
+        Arc<Mutex<Option<String>>>,
+        RemoteForwardMap,
+    )> {
         let mut config = client::Config {
             nodelay: true,
             inactivity_timeout: None,
@@ -260,11 +361,13 @@ impl SshSessionManager {
         }
         let config = Arc::new(config);
         let disconnect_reason = Arc::new(Mutex::new(None));
+        let remote_forwards: RemoteForwardMap = Arc::new(DashMap::new());
         let handler = StermClientHandler {
             hostname: target.hostname.clone(),
             port: target.port,
             verifier: Arc::clone(&verifier),
             disconnect_reason: Arc::clone(&disconnect_reason),
+            remote_forwards: Arc::clone(&remote_forwards),
         };
 
         let mut handle = match tunnel {
@@ -292,7 +395,7 @@ impl SshSessionManager {
         };
 
         Self::authenticate(&mut handle, target, verifier.as_ref()).await?;
-        Ok((handle, disconnect_reason))
+        Ok((handle, disconnect_reason, remote_forwards))
     }
 
     async fn try_agent_identities<S>(
@@ -580,7 +683,7 @@ impl SshSessionManager {
     where
         F: FnMut(TerminalEvent) + Send + 'static,
     {
-        let (target_handle, jump_handles, disconnect_reason) =
+        let (target_handle, jump_handles, disconnect_reason, remote_forwards) =
             self.connect_chain(&req, verifier).await?;
         let target_handle = Arc::new(target_handle);
 
@@ -617,6 +720,7 @@ impl SshSessionManager {
                 handle: Arc::clone(&target_handle),
                 _jump_handles: jump_handles,
                 shell_tx: Some(ctrl_tx),
+                remote_forwards,
             },
         );
 
@@ -679,13 +783,13 @@ impl SshSessionManager {
         Ok(session_id)
     }
 
-    /// Connects a transport-only SSH session (e.g., for direct SFTP without spawning a PTY).
+    /// Connects a transport-only SSH session (e.g., for direct SFTP or Port Forwarding without spawning a PTY).
     pub async fn connect_transport_only(
         &self,
         req: ConnectRequest,
         verifier: Arc<dyn HostKeyVerifier>,
     ) -> SshResult<String> {
-        let (target_handle, jump_handles, _disconnect_reason) =
+        let (target_handle, jump_handles, _disconnect_reason, remote_forwards) =
             self.connect_chain(&req, verifier).await?;
         let session_id = Uuid::now_v7().to_string();
         self.sessions.insert(
@@ -694,9 +798,45 @@ impl SshSessionManager {
                 handle: Arc::new(target_handle),
                 _jump_handles: jump_handles,
                 shell_tx: None,
+                remote_forwards,
             },
         );
         Ok(session_id)
+    }
+
+    /// Executes a one-shot non-interactive command over SSH (e.g., `ssh-copy-id` public key deployment)
+    /// and returns `(exit_code, combined_output)`.
+    pub async fn exec_command(
+        &self,
+        req: ConnectRequest,
+        verifier: Arc<dyn HostKeyVerifier>,
+        command: &str,
+    ) -> SshResult<(u32, String)> {
+        let (target_handle, _jump_handles, _, _) = self.connect_chain(&req, verifier).await?;
+        let mut channel = target_handle
+            .channel_open_session()
+            .await
+            .map_err(|e| SshError::Channel(e.to_string()))?;
+        channel
+            .exec(true, command)
+            .await
+            .map_err(|e| SshError::Channel(e.to_string()))?;
+
+        let mut output = Vec::new();
+        let mut exit_code: u32 = 0;
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                ChannelMsg::Data { data } => output.extend_from_slice(&data),
+                ChannelMsg::ExtendedData { data, .. } => output.extend_from_slice(&data),
+                ChannelMsg::ExitStatus { exit_status } => exit_code = exit_status,
+                ChannelMsg::Eof | ChannelMsg::Close => break,
+                _ => {}
+            }
+        }
+        let _ = target_handle
+            .disconnect(russh::Disconnect::ByApplication, "done", "en")
+            .await;
+        Ok((exit_code, String::from_utf8_lossy(&output).to_string()))
     }
 
     async fn connect_chain(
@@ -707,18 +847,24 @@ impl SshSessionManager {
         Handle<StermClientHandler>,
         Vec<Handle<StermClientHandler>>,
         Arc<Mutex<Option<String>>>,
+        RemoteForwardMap,
     )> {
         let mut jump_handles: Vec<Handle<StermClientHandler>> = Vec::new();
 
         for hop in &req.jump_chain {
-            let (h, _) =
+            let (h, _, _) =
                 Self::connect_single(hop, Arc::clone(&verifier), jump_handles.last()).await?;
             jump_handles.push(h);
         }
 
-        let (target_handle, disconnect_reason) =
+        let (target_handle, disconnect_reason, remote_forwards) =
             Self::connect_single(&req.target, verifier, jump_handles.last()).await?;
-        Ok((target_handle, jump_handles, disconnect_reason))
+        Ok((
+            target_handle,
+            jump_handles,
+            disconnect_reason,
+            remote_forwards,
+        ))
     }
 
     /// Initiates an SSH transport key re-exchange on an active session.
@@ -794,7 +940,262 @@ impl SshSessionManager {
         Ok(channel.into_stream())
     }
 
+    /// Starts a Local Port Forward (`-L bind_address:bind_port:target_host:target_port`).
+    /// Returns the actual bound local port (useful when `bind_port == 0`).
+    pub async fn start_local_forward(
+        &self,
+        session_id: &str,
+        tunnel_id: String,
+        bind_address: String,
+        bind_port: u16,
+        target_host: String,
+        target_port: u16,
+    ) -> SshResult<u16> {
+        let handle = {
+            let entry = self
+                .sessions
+                .get(session_id)
+                .ok_or_else(|| SshError::SessionNotFound(session_id.to_string()))?;
+            Arc::clone(&entry.handle)
+        };
+
+        let bind_str = format!("{bind_address}:{bind_port}");
+        let listener = TcpListener::bind(&bind_str)
+            .await
+            .map_err(|e| SshError::Channel(format!("failed to bind {bind_str}: {e}")))?;
+        let actual_port = listener
+            .local_addr()
+            .map_err(|e| SshError::Channel(e.to_string()))?
+            .port();
+
+        let cancel = CancellationToken::new();
+        let counters = TunnelCounters::new();
+        self.tunnels.insert(
+            tunnel_id.clone(),
+            ActiveTunnel {
+                tunnel_id: tunnel_id.clone(),
+                session_id: session_id.to_string(),
+                kind: TunnelKind::Local,
+                bind_address: bind_address.clone(),
+                bind_port: actual_port,
+                target_host: Some(target_host.clone()),
+                target_port: Some(target_port),
+                cancel: cancel.clone(),
+                counters: counters.clone(),
+            },
+        );
+
+        let tunnels_map = Arc::clone(&self.tunnels);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    accepted = listener.accept() => {
+                        let Ok((mut stream, peer)) = accepted else { break; };
+                        let _ = stream.set_nodelay(true);
+                        let handle_c = Arc::clone(&handle);
+                        let target_h = target_host.clone();
+                        let cnt = counters.clone();
+                        tokio::spawn(async move {
+                            let Ok(channel) = handle_c
+                                .channel_open_direct_tcpip(
+                                    target_h,
+                                    target_port as u32,
+                                    peer.ip().to_string(),
+                                    peer.port() as u32,
+                                )
+                                .await
+                            else {
+                                return;
+                            };
+                            cnt.active_connections.fetch_add(1, Ordering::Relaxed);
+                            let mut ssh_stream = channel.into_stream();
+                            if let Ok((to_ssh, from_ssh)) =
+                                tokio::io::copy_bidirectional(&mut stream, &mut ssh_stream).await
+                            {
+                                cnt.bytes_tx.fetch_add(to_ssh, Ordering::Relaxed);
+                                cnt.bytes_rx.fetch_add(from_ssh, Ordering::Relaxed);
+                            }
+                            cnt.active_connections.fetch_sub(1, Ordering::Relaxed);
+                        });
+                    }
+                }
+            }
+            tunnels_map.remove(&tunnel_id);
+        });
+
+        Ok(actual_port)
+    }
+
+    /// Starts a Dynamic SOCKS5 Proxy (`-D bind_address:bind_port`) over an active SSH session.
+    pub async fn start_dynamic_socks5(
+        &self,
+        session_id: &str,
+        tunnel_id: String,
+        bind_address: String,
+        bind_port: u16,
+    ) -> SshResult<u16> {
+        let handle = {
+            let entry = self
+                .sessions
+                .get(session_id)
+                .ok_or_else(|| SshError::SessionNotFound(session_id.to_string()))?;
+            Arc::clone(&entry.handle)
+        };
+
+        let bind_str = format!("{bind_address}:{bind_port}");
+        let listener = TcpListener::bind(&bind_str)
+            .await
+            .map_err(|e| SshError::Channel(format!("failed to bind SOCKS5 {bind_str}: {e}")))?;
+        let actual_port = listener
+            .local_addr()
+            .map_err(|e| SshError::Channel(e.to_string()))?
+            .port();
+
+        let cancel = CancellationToken::new();
+        let counters = TunnelCounters::new();
+        self.tunnels.insert(
+            tunnel_id.clone(),
+            ActiveTunnel {
+                tunnel_id: tunnel_id.clone(),
+                session_id: session_id.to_string(),
+                kind: TunnelKind::DynamicSocks5,
+                bind_address: bind_address.clone(),
+                bind_port: actual_port,
+                target_host: None,
+                target_port: None,
+                cancel: cancel.clone(),
+                counters: counters.clone(),
+            },
+        );
+
+        let tunnels_map = Arc::clone(&self.tunnels);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    accepted = listener.accept() => {
+                        let Ok((stream, peer)) = accepted else { break; };
+                        let _ = stream.set_nodelay(true);
+                        let handle_c = Arc::clone(&handle);
+                        let cnt = counters.clone();
+                        tokio::spawn(async move {
+                            let _ = handle_socks5_client(stream, peer, handle_c, cnt).await;
+                        });
+                    }
+                }
+            }
+            tunnels_map.remove(&tunnel_id);
+        });
+
+        Ok(actual_port)
+    }
+
+    /// Starts a Remote Port Forward (`-R bind_address:bind_port:target_host:target_port`).
+    pub async fn start_remote_forward(
+        &self,
+        session_id: &str,
+        tunnel_id: String,
+        bind_address: String,
+        bind_port: u16,
+        target_host: String,
+        target_port: u16,
+    ) -> SshResult<u16> {
+        let (handle, remote_forwards) = {
+            let entry = self
+                .sessions
+                .get(session_id)
+                .ok_or_else(|| SshError::SessionNotFound(session_id.to_string()))?;
+            (Arc::clone(&entry.handle), Arc::clone(&entry.remote_forwards))
+        };
+
+        let counters = TunnelCounters::new();
+        let bound_port = handle
+            .tcpip_forward(bind_address.clone(), bind_port as u32)
+            .await
+            .map_err(|e| SshError::Channel(format!("remote tcpip_forward failed: {e}")))?;
+        let final_port = if bound_port > 0 {
+            bound_port as u16
+        } else {
+            bind_port
+        };
+
+        remote_forwards.insert(
+            final_port as u32,
+            RemoteForwardEntry {
+                target_host: target_host.clone(),
+                target_port,
+                counters: counters.clone(),
+            },
+        );
+
+        let cancel = CancellationToken::new();
+        self.tunnels.insert(
+            tunnel_id.clone(),
+            ActiveTunnel {
+                tunnel_id,
+                session_id: session_id.to_string(),
+                kind: TunnelKind::Remote,
+                bind_address,
+                bind_port: final_port,
+                target_host: Some(target_host),
+                target_port: Some(target_port),
+                cancel,
+                counters,
+            },
+        );
+        Ok(final_port)
+    }
+
+    /// Stops an active port forward tunnel cleanly.
+    pub async fn stop_tunnel(&self, tunnel_id: &str) -> SshResult<()> {
+        if let Some((_, tunnel)) = self.tunnels.remove(tunnel_id) {
+            tunnel.cancel.cancel();
+            if tunnel.kind == TunnelKind::Remote {
+                if let Some(session) = self.sessions.get(&tunnel.session_id) {
+                    session.remote_forwards.remove(&(tunnel.bind_port as u32));
+                    let _ = session
+                        .handle
+                        .cancel_tcpip_forward(tunnel.bind_address, tunnel.bind_port as u32)
+                        .await;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn list_tunnels(&self) -> Vec<TunnelStats> {
+        self.tunnels
+            .iter()
+            .map(|entry| {
+                let t = entry.value();
+                TunnelStats {
+                    tunnel_id: t.tunnel_id.clone(),
+                    session_id: t.session_id.clone(),
+                    kind: t.kind,
+                    bind_address: t.bind_address.clone(),
+                    bind_port: t.bind_port,
+                    target_host: t.target_host.clone(),
+                    target_port: t.target_port,
+                    active_connections: t.counters.active_connections.load(Ordering::Relaxed),
+                    bytes_tx: t.counters.bytes_tx.load(Ordering::Relaxed),
+                    bytes_rx: t.counters.bytes_rx.load(Ordering::Relaxed),
+                    running: !t.cancel.is_cancelled(),
+                }
+            })
+            .collect()
+    }
+
     pub async fn close_session(&self, session_id: &str) -> SshResult<()> {
+        let to_stop: Vec<String> = self
+            .tunnels
+            .iter()
+            .filter(|e| e.value().session_id == session_id)
+            .map(|e| e.key().clone())
+            .collect();
+        for tid in to_stop {
+            let _ = self.stop_tunnel(&tid).await;
+        }
         if let Some((_, session)) = self.sessions.remove(session_id) {
             if let Some(tx) = session.shell_tx {
                 let _ = tx.send(ShellControl::Close).await;
@@ -810,4 +1211,99 @@ impl SshSessionManager {
     pub fn active_session_ids(&self) -> Vec<String> {
         self.sessions.iter().map(|e| e.key().clone()).collect()
     }
+}
+
+/// Minimal RFC 1928 SOCKS5 (no-auth, CONNECT IPv4/Domain/IPv6) handler backed by SSH `direct-tcpip`.
+async fn handle_socks5_client(
+    mut stream: TcpStream,
+    peer: std::net::SocketAddr,
+    handle: Arc<Handle<StermClientHandler>>,
+    counters: TunnelCounters,
+) -> std::io::Result<()> {
+    // 1. Greeting: VER(1) NMETHODS(1) METHODS(N)
+    let mut hdr = [0u8; 2];
+    stream.read_exact(&mut hdr).await?;
+    if hdr[0] != 0x05 {
+        return Ok(());
+    }
+    let mut methods = vec![0u8; hdr[1] as usize];
+    stream.read_exact(&mut methods).await?;
+    if !methods.contains(&0x00) {
+        let _ = stream.write_all(&[0x05, 0xFF]).await;
+        return Ok(());
+    }
+    stream.write_all(&[0x05, 0x00]).await?;
+
+    // 2. Request: VER(1) CMD(1) RSV(1) ATYP(1) DST.ADDR DST.PORT(2)
+    let mut req = [0u8; 4];
+    stream.read_exact(&mut req).await?;
+    if req[0] != 0x05 || req[1] != 0x01 {
+        // Only CONNECT (0x01) is supported
+        let _ = stream
+            .write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await;
+        return Ok(());
+    }
+    let dest_host = match req[3] {
+        0x01 => {
+            let mut b = [0u8; 4];
+            stream.read_exact(&mut b).await?;
+            Ipv4Addr::from(b).to_string()
+        }
+        0x03 => {
+            let mut len = [0u8; 1];
+            stream.read_exact(&mut len).await?;
+            let mut domain = vec![0u8; len[0] as usize];
+            stream.read_exact(&mut domain).await?;
+            String::from_utf8_lossy(&domain).to_string()
+        }
+        0x04 => {
+            let mut b = [0u8; 16];
+            stream.read_exact(&mut b).await?;
+            Ipv6Addr::from(b).to_string()
+        }
+        _ => {
+            let _ = stream
+                .write_all(&[0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await;
+            return Ok(());
+        }
+    };
+    let mut port_buf = [0u8; 2];
+    stream.read_exact(&mut port_buf).await?;
+    let dest_port = u16::from_be_bytes(port_buf);
+
+    let channel = match handle
+        .channel_open_direct_tcpip(
+            dest_host,
+            dest_port as u32,
+            peer.ip().to_string(),
+            peer.port() as u32,
+        )
+        .await
+    {
+        Ok(ch) => ch,
+        Err(_) => {
+            let _ = stream
+                .write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await;
+            return Ok(());
+        }
+    };
+
+    // Success reply
+    stream
+        .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await?;
+
+    counters.active_connections.fetch_add(1, Ordering::Relaxed);
+    let mut ssh_stream = channel.into_stream();
+    if let Ok((to_ssh, from_ssh)) =
+        tokio::io::copy_bidirectional(&mut stream, &mut ssh_stream).await
+    {
+        counters.bytes_tx.fetch_add(to_ssh, Ordering::Relaxed);
+        counters.bytes_rx.fetch_add(from_ssh, Ordering::Relaxed);
+    }
+    counters.active_connections.fetch_sub(1, Ordering::Relaxed);
+    Ok(())
 }

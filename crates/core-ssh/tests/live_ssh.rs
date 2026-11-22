@@ -69,6 +69,7 @@ impl server::Server for EchoSshServer {
             allowed_cert_ca: self.allowed_cert_ca.clone(),
             allowed_kbi_code: self.allowed_kbi_code.clone(),
             last_resize: None,
+            tunnel_channels: std::collections::HashSet::new(),
         }
     }
 }
@@ -79,6 +80,7 @@ struct EchoSessionHandler {
     allowed_cert_ca: Option<PublicKey>,
     allowed_kbi_code: Option<String>,
     last_resize: Option<(u32, u32)>,
+    tunnel_channels: std::collections::HashSet<ChannelId>,
 }
 
 impl server::Handler for EchoSessionHandler {
@@ -204,12 +206,60 @@ impl server::Handler for EchoSessionHandler {
         Ok(())
     }
 
+    async fn channel_open_direct_tcpip(
+        &mut self,
+        channel: Channel<Msg>,
+        host_to_connect: &str,
+        port_to_connect: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: ChannelOpenHandle,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let addr = format!("{host_to_connect}:{port_to_connect}");
+        match tokio::net::TcpStream::connect(&addr).await {
+            Ok(mut target) => {
+                self.tunnel_channels.insert(channel.id());
+                reply.accept().await;
+                tokio::spawn(async move {
+                    let mut stream = channel.into_stream();
+                    let _ = tokio::io::copy_bidirectional(&mut stream, &mut target).await;
+                });
+            }
+            Err(_) => {
+                reply
+                    .reject(russh::ChannelOpenFailure::ConnectFailed)
+                    .await;
+            }
+        }
+        Ok(())
+    }
+
+    async fn exec_request(
+        &mut self,
+        channel: ChannelId,
+        data: &[u8],
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let cmd = String::from_utf8_lossy(data).to_string();
+        let _ = session.channel_success(channel);
+        let reply = format!("EXEC_OK:{cmd}\n");
+        let _ = session.data(channel, reply.into_bytes());
+        let _ = session.exit_status_request(channel, 0);
+        let _ = session.eof(channel);
+        let _ = session.close(channel);
+        Ok(())
+    }
+
     async fn data(
         &mut self,
         channel: ChannelId,
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        if self.tunnel_channels.contains(&channel) {
+            return Ok(());
+        }
         let mut echoed = b"ECHO:".to_vec();
         echoed.extend_from_slice(data);
         let _ = session.data(channel, echoed);
@@ -522,5 +572,119 @@ async fn live_ssh_rekey_and_keepalive_stays_connected() {
         }
     }
 
+    mgr.close_session(&sid).await.unwrap();
+}
+
+#[tokio::test]
+async fn live_ssh_local_and_socks5_port_forwarding_and_exec() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let client_key = PrivateKey::random(&mut test_rng(), Algorithm::Ed25519).unwrap();
+    let test_pw = format!("ssh-fixture-{}", rand::random::<u64>());
+    let ssh_port =
+        spawn_test_sshd(test_pw.clone(), client_key.public_key().clone(), None, None).await;
+
+    // Spawn a tiny TCP backend echo service to reach through the SSH tunnel
+    let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = backend.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 64];
+                if let Ok(n) = s.read(&mut buf).await {
+                    let mut out = b"TUNNELED:".to_vec();
+                    out.extend_from_slice(&buf[..n]);
+                    let _ = s.write_all(&out).await;
+                }
+            });
+        }
+    });
+
+    let mgr = SshSessionManager::new();
+    let req = ConnectRequest {
+        jump_chain: vec![],
+        target: SshTarget {
+            hostname: "127.0.0.1".into(),
+            port: ssh_port,
+            username: "tester".into(),
+            auth: SshAuthMethod::Password {
+                password: test_pw.clone(),
+            },
+            keepalive_secs: 0,
+        },
+        cols: 80,
+        rows: 24,
+        startup_command: None,
+    };
+
+    // 1. One-shot exec_command (used by ssh-copy-id)
+    let (code, out) = mgr
+        .exec_command(req.clone(), Arc::new(AcceptAllHostKeys), "echo hi")
+        .await
+        .expect("exec_command");
+    assert_eq!(code, 0);
+    assert!(out.contains("EXEC_OK:echo hi"));
+
+    // 2. Local Port Forward (-L)
+    let sid = mgr
+        .connect_transport_only(req, Arc::new(AcceptAllHostKeys))
+        .await
+        .expect("transport");
+    let local_port = mgr
+        .start_local_forward(
+            &sid,
+            "tun-local".into(),
+            "127.0.0.1".into(),
+            0,
+            "127.0.0.1".into(),
+            backend_port,
+        )
+        .await
+        .expect("start_local_forward");
+
+    {
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", local_port))
+            .await
+            .unwrap();
+        client.write_all(b"ping-local").await.unwrap();
+        let mut buf = [0u8; 64];
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"TUNNELED:ping-local");
+    }
+
+    // 3. Dynamic SOCKS5 Proxy (-D)
+    let socks_port = mgr
+        .start_dynamic_socks5(&sid, "tun-socks".into(), "127.0.0.1".into(), 0)
+        .await
+        .expect("start_dynamic_socks5");
+
+    {
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", socks_port))
+            .await
+            .unwrap();
+        // Greeting: SOCKS5, 1 method = NO AUTH
+        client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut greeting_resp = [0u8; 2];
+        client.read_exact(&mut greeting_resp).await.unwrap();
+        assert_eq!(greeting_resp, [0x05, 0x00]);
+
+        // CONNECT 127.0.0.1:backend_port
+        let mut req_pkt = vec![0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1];
+        req_pkt.extend_from_slice(&backend_port.to_be_bytes());
+        client.write_all(&req_pkt).await.unwrap();
+        let mut conn_resp = [0u8; 10];
+        client.read_exact(&mut conn_resp).await.unwrap();
+        assert_eq!(conn_resp[1], 0x00);
+
+        client.write_all(b"ping-socks").await.unwrap();
+        let mut buf = [0u8; 64];
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"TUNNELED:ping-socks");
+    }
+
+    assert_eq!(mgr.list_tunnels().len(), 2);
+    mgr.stop_tunnel("tun-local").await.unwrap();
+    mgr.stop_tunnel("tun-socks").await.unwrap();
+    assert!(mgr.list_tunnels().is_empty());
     mgr.close_session(&sid).await.unwrap();
 }

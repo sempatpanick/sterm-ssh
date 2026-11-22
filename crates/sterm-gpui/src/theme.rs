@@ -157,6 +157,8 @@ pub struct UiSettings {
     pub terminal_cursor_style: TerminalCursorStyle,
     pub ssh_keepalive_secs: u32,
     pub auto_sync: bool,
+    pub auto_reconnect: bool,
+    pub auto_lock_minutes: u32,
 }
 
 impl Default for UiSettings {
@@ -173,8 +175,42 @@ impl Default for UiSettings {
             terminal_cursor_style: TerminalCursorStyle::Block,
             ssh_keepalive_secs: 30,
             auto_sync: true,
+            auto_reconnect: true,
+            auto_lock_minutes: 0,
         }
     }
+}
+
+/// Detects an environment badge (`PROD` / `STAGING` / `DEV`) from a host's tags or group name
+/// for instant visual safety stripes on tabs and terminal headers.
+pub fn env_badge_for_host(
+    tags: &[String],
+    group_name: Option<&str>,
+    t: &ThemePalette,
+) -> Option<(Hsla, &'static str)> {
+    let mut tokens: Vec<String> = tags.iter().map(|s| s.trim().to_lowercase()).collect();
+    if let Some(g) = group_name {
+        tokens.push(g.trim().to_lowercase());
+    }
+    if tokens
+        .iter()
+        .any(|s| s == "prod" || s == "production" || s.contains("prod"))
+    {
+        return Some((t.danger, "PROD"));
+    }
+    if tokens
+        .iter()
+        .any(|s| s == "staging" || s == "stage" || s == "uat" || s.contains("stag"))
+    {
+        return Some((t.warning, "STAGING"));
+    }
+    if tokens
+        .iter()
+        .any(|s| s == "dev" || s == "development" || s == "local" || s.contains("dev"))
+    {
+        return Some((t.success, "DEV"));
+    }
+    None
 }
 
 /// Admin Studio visual tokens matching the approved Light & Dark adaptive palette.
@@ -377,5 +413,28 @@ pub fn format_bytes(bytes: u64) -> String {
         format!("{:.1} KB", b / KB)
     } else {
         format!("{bytes} B")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn env_badge_detects_prod_staging_dev_and_none() {
+        let t = ThemePalette::for_mode(ThemeMode::Dark);
+        assert_eq!(
+            env_badge_for_host(&["production".into()], None, &t).map(|(_, l)| l),
+            Some("PROD")
+        );
+        assert_eq!(
+            env_badge_for_host(&[], Some("Staging Cluster"), &t).map(|(_, l)| l),
+            Some("STAGING")
+        );
+        assert_eq!(
+            env_badge_for_host(&["dev-box".into()], None, &t).map(|(_, l)| l),
+            Some("DEV")
+        );
+        assert!(env_badge_for_host(&["db".into()], Some("Internal"), &t).is_none());
     }
 }

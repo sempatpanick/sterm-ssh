@@ -1,8 +1,9 @@
 use core_ssh::types::HostKeyStatus;
-use core_vault::models::CredentialKind;
+use core_vault::models::{CredentialKind, PortForwardKind};
 use gpui::{div, prelude::*, px, rgb, AnyElement, Context, Entity, FontWeight, MouseButton};
 
 use crate::app::{ActiveModal, ConfirmAction, StermAdminApp};
+use crate::local_shell::LocalShellManager;
 use crate::motion::animate_modal_enter;
 use crate::text_field::TextField;
 use crate::theme::{TerminalThemeId, ThemePalette};
@@ -30,6 +31,15 @@ impl StermAdminApp {
             }
             ActiveModal::CredentialEditor { editing_id } => self
                 .render_credential_editor_modal(t, editing_id, cx)
+                .into_any_element(),
+            ActiveModal::TunnelEditor { editing_id } => self
+                .render_tunnel_editor_modal(t, editing_id, cx)
+                .into_any_element(),
+            ActiveModal::DeployKey { label, public_key } => self
+                .render_deploy_key_modal(t, label, public_key, cx)
+                .into_any_element(),
+            ActiveModal::SnippetVars { command, vars } => self
+                .render_snippet_vars_modal(t, command, vars, cx)
                 .into_any_element(),
             ActiveModal::SshConfigImport { entries, selected } => self
                 .render_ssh_config_import_modal(t, entries, selected, cx)
@@ -1763,6 +1773,50 @@ impl StermAdminApp {
                     .flex()
                     .flex_col()
                     .gap_1p5()
+                    .child({
+                        let ws_l = workspace_tab_id.clone();
+                        let pid_l = target_pane_id.clone();
+                        let default_shell = LocalShellManager::default_shell();
+                        div()
+                            .id("split-pick-local-shell")
+                            .px_3()
+                            .py_2()
+                            .rounded_lg()
+                            .bg(t.accent_soft)
+                            .border_1()
+                            .border_color(t.accent)
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_local_shell(
+                                    Some(default_shell.clone()),
+                                    Some((ws_l.clone(), pid_l.clone(), direction)),
+                                    Some(window),
+                                    cx,
+                                );
+                            }))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(t.accent)
+                                            .child("Local Shell (PowerShell / Zsh / Bash)"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(11.0))
+                                            .text_color(t.text_muted)
+                                            .child("Open a native local PTY pane alongside SSH"),
+                                    ),
+                            )
+                            .child(div().text_xs().text_color(t.accent).child("Split ↵"))
+                    })
                     .when(self.snapshot.hosts.is_empty(), |el| {
                         el.child(
                             div()
@@ -2316,6 +2370,11 @@ impl StermAdminApp {
                 format!("Remove '{command}' from saved snippets and history?"),
                 "Delete Snippet",
             ),
+            ConfirmAction::DeleteTunnel { label, .. } => (
+                "Delete Port Forward Tunnel?",
+                format!("Stop (if running) and permanently remove tunnel '{label}' from your vault?"),
+                "Delete Tunnel",
+            ),
             ConfirmAction::DeleteRemoteFile { name, is_dir, .. } => (
                 if *is_dir {
                     "Delete Remote Folder?"
@@ -2324,6 +2383,16 @@ impl StermAdminApp {
                 },
                 format!("Permanently delete '{name}' on the remote server? This cannot be undone."),
                 "Delete Remote",
+            ),
+            ConfirmAction::OverwriteUpload { file_name, .. } => (
+                "Overwrite Remote File?",
+                format!("'{file_name}' already exists in the remote directory. Replace it with the local file?"),
+                "Overwrite Remote",
+            ),
+            ConfirmAction::OverwriteDownload { file_name, .. } => (
+                "Overwrite Local File?",
+                format!("'{file_name}' already exists in your local directory. Replace it with the remote file?"),
+                "Overwrite Local",
             ),
             ConfirmAction::SignOut => (
                 "Sign Out of E2EE Sync?",
@@ -2374,6 +2443,337 @@ impl StermAdminApp {
                                 this.execute_confirmed_action(action.clone(), cx);
                             }))
                             .child(cta),
+                    ),
+            )
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 3 Modals: Tunnel Editor, Deploy Key (ssh-copy-id), Snippet Vars
+    // -------------------------------------------------------------------------
+
+    fn render_tunnel_editor_modal(
+        &self,
+        t: &ThemePalette,
+        editing_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let is_edit = editing_id.is_some();
+        let save_id = editing_id;
+        let kinds = [
+            (PortForwardKind::Local, "-L Local Forward"),
+            (PortForwardKind::Remote, "-R Remote Forward"),
+            (PortForwardKind::DynamicSocks5, "-D SOCKS5 Proxy"),
+        ];
+
+        div()
+            .w(px(540.0))
+            .rounded_2xl()
+            .bg(t.bg_card)
+            .border_1()
+            .border_color(t.border_strong)
+            .shadow_2xl()
+            .p_5()
+            .flex()
+            .flex_col()
+            .gap_3p5()
+            .child(self.modal_header(
+                t,
+                if is_edit {
+                    "Edit SSH Port Forward Tunnel"
+                } else {
+                    "New SSH Port Forward Tunnel"
+                },
+                "Encrypted & synced in your vault. Supports Local (-L), Remote (-R), and Dynamic SOCKS5 (-D).",
+                cx,
+            ))
+            .child(div().flex().gap_1p5().children(kinds.into_iter().enumerate().map(
+                |(ix, (kind, lbl))| {
+                    let active = self.tun_kind == kind;
+                    div()
+                        .id(("tun-kind", ix))
+                        .px_2p5()
+                        .py_1()
+                        .rounded_lg()
+                        .border_1()
+                        .text_xs()
+                        .cursor_pointer()
+                        .bg(if active { t.accent_soft } else { t.bg_subtle })
+                        .border_color(if active { t.accent } else { t.border })
+                        .text_color(if active { t.accent } else { t.text_secondary })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.tun_kind = kind;
+                            cx.notify();
+                        }))
+                        .child(lbl)
+                },
+            )))
+            .child(self.labeled_field(t, "Label (optional)", self.tun_label.clone()))
+            // Host selector
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(t.text_secondary)
+                            .child("SSH Host"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_1p5()
+                            .children(self.snapshot.hosts.iter().enumerate().map(|(ix, h)| {
+                                let active =
+                                    self.tun_host_id.as_deref() == Some(h.id.as_str());
+                                let hid = h.id.clone();
+                                div()
+                                    .id(("tun-host", ix))
+                                    .px_2p5()
+                                    .py_1()
+                                    .rounded_md()
+                                    .border_1()
+                                    .text_size(px(11.0))
+                                    .cursor_pointer()
+                                    .bg(if active { t.accent_soft } else { t.bg_subtle })
+                                    .border_color(if active { t.accent } else { t.border })
+                                    .text_color(if active { t.accent } else { t.text_primary })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.tun_host_id = Some(hid.clone());
+                                        cx.notify();
+                                    }))
+                                    .child(h.label.clone())
+                            })),
+                    ),
+            )
+            // Bind address & port
+            .child(
+                div()
+                    .grid()
+                    .grid_cols(3)
+                    .gap_2p5()
+                    .child(div().col_span(2).child(self.labeled_field(
+                        t,
+                        if self.tun_kind == PortForwardKind::Remote {
+                            "Remote Bind Address"
+                        } else {
+                            "Local Bind Address"
+                        },
+                        self.tun_bind_addr.clone(),
+                    )))
+                    .child(self.labeled_field(t, "Bind Port", self.tun_bind_port.clone())),
+            )
+            // Target host & port (Local & Remote only)
+            .when(self.tun_kind != PortForwardKind::DynamicSocks5, |el| {
+                el.child(
+                    div()
+                        .grid()
+                        .grid_cols(3)
+                        .gap_2p5()
+                        .child(div().col_span(2).child(self.labeled_field(
+                            t,
+                            if self.tun_kind == PortForwardKind::Remote {
+                                "Local Target Host"
+                            } else {
+                                "Remote Destination Host"
+                            },
+                            self.tun_target_host.clone(),
+                        )))
+                        .child(self.labeled_field(t, "Target Port", self.tun_target_port.clone())),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap_2()
+                    .pt_2()
+                    .child(self.cancel_modal_btn(t, cx))
+                    .child(
+                        div()
+                            .id("tun-save-btn")
+                            .px_4()
+                            .py_2()
+                            .rounded_lg()
+                            .bg(t.accent_solid)
+                            .text_color(gpui::white())
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.save_tunnel_from_modal(save_id.clone(), cx);
+                            }))
+                            .child("Save Tunnel"),
+                    ),
+            )
+    }
+
+    fn render_deploy_key_modal(
+        &self,
+        t: &ThemePalette,
+        label: String,
+        public_key: String,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .w(px(500.0))
+            .max_h(px(560.0))
+            .rounded_2xl()
+            .bg(t.bg_card)
+            .border_1()
+            .border_color(t.border_strong)
+            .shadow_2xl()
+            .p_5()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(self.modal_header(
+                t,
+                &format!("Deploy Public Key ({label})"),
+                "1-click ssh-copy-id: appends this public key idempotently to ~/.ssh/authorized_keys.",
+                cx,
+            ))
+            .child(
+                div()
+                    .id("deploy-key-hosts")
+                    .max_h(px(340.0))
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .gap_1p5()
+                    .when(self.snapshot.hosts.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .py_4()
+                                .text_xs()
+                                .text_color(t.text_muted)
+                                .text_center()
+                                .child("No saved hosts in vault yet."),
+                        )
+                    })
+                    .children(self.snapshot.hosts.iter().enumerate().map(|(ix, h)| {
+                        let hid = h.id.clone();
+                        let pk = public_key.clone();
+                        div()
+                            .id(("dep-host", ix))
+                            .px_3()
+                            .py_2()
+                            .rounded_lg()
+                            .bg(t.bg_subtle)
+                            .hover(|s| s.bg(t.bg_hover))
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.deploy_key_to_host(hid.clone(), pk.clone(), cx);
+                            }))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child(h.label.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(11.0))
+                                            .font_family("Consolas")
+                                            .text_color(t.text_muted)
+                                            .child(format!(
+                                                "{}@{}:{}",
+                                                h.username, h.hostname, h.port
+                                            )),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .px_2p5()
+                                    .py_1()
+                                    .rounded_md()
+                                    .bg(t.accent_soft)
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(t.accent)
+                                    .child("Deploy →"),
+                            )
+                    })),
+            )
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .child(self.cancel_modal_btn(t, cx)),
+            )
+    }
+
+    fn render_snippet_vars_modal(
+        &self,
+        t: &ThemePalette,
+        command: String,
+        vars: Vec<String>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let cmd_run = command.clone();
+        let vars_run = vars.clone();
+        div()
+            .w(px(480.0))
+            .rounded_2xl()
+            .bg(t.bg_card)
+            .border_1()
+            .border_color(t.border_strong)
+            .shadow_2xl()
+            .p_5()
+            .flex()
+            .flex_col()
+            .gap_3p5()
+            .child(self.modal_header(
+                t,
+                "Fill Snippet Template Variables",
+                "Values will be substituted into the command and executed in your active terminal.",
+                cx,
+            ))
+            .child(
+                div()
+                    .p_2p5()
+                    .rounded_lg()
+                    .bg(t.bg_subtle)
+                    .font_family("Consolas")
+                    .text_xs()
+                    .text_color(t.text_primary)
+                    .child(command),
+            )
+            .children(vars.iter().enumerate().map(|(ix, name)| {
+                let field = self.snippet_var_inputs[ix].clone();
+                self.labeled_field(t, &format!("{{{{{name}}}}}"), field)
+            }))
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(self.cancel_modal_btn(t, cx))
+                    .child(
+                        div()
+                            .id("snip-vars-run")
+                            .px_4()
+                            .py_2()
+                            .rounded_lg()
+                            .bg(t.accent_solid)
+                            .text_color(gpui::white())
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.submit_snippet_vars(cmd_run.clone(), vars_run.clone(), cx);
+                            }))
+                            .child("▶ Run Command"),
                     ),
             )
     }

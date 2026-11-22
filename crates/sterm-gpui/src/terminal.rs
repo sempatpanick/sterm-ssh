@@ -1,5 +1,8 @@
+use std::fs::{File, OpenOptions};
+use std::io::Write as _;
 use std::num::NonZeroU16;
 use std::ops::Range;
+use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
@@ -364,6 +367,13 @@ pub struct TerminalTab {
     pub search_query: String,
     pub search_matches: Vec<(usize, u16, u16)>,
     pub active_match_idx: usize,
+    // Phase 3: Local PTY shell, environment stripe, auto-reconnect & transcript logging
+    pub is_local: bool,
+    pub env_label: Option<&'static str>,
+    pub manually_closed: bool,
+    pub reconnect_attempts: u32,
+    pub transcript_path: Option<PathBuf>,
+    pub transcript_file: Option<File>,
 }
 
 impl TerminalTab {
@@ -419,7 +429,92 @@ impl TerminalTab {
             search_query: String::new(),
             search_matches: Vec::new(),
             active_match_idx: 0,
+            is_local: false,
+            env_label: None,
+            manually_closed: false,
+            reconnect_attempts: 0,
+            transcript_path: None,
+            transcript_file: None,
         }
+    }
+
+    pub fn local_shell(tab_id: String, label: String, session_id: String, program: String) -> Self {
+        let parser = vt100::Parser::new_with_callbacks(
+            NonZeroU16::new(DEFAULT_TERM_ROWS).unwrap(),
+            NonZeroU16::new(DEFAULT_TERM_COLS).unwrap(),
+            TERM_SCROLLBACK_LEN,
+            Osc8Tracker::default(),
+        );
+        Self {
+            tab_id,
+            session_id: Some(session_id),
+            host_id: None,
+            label,
+            hostname: program,
+            port: 0,
+            username: "local".into(),
+            theme_id: None,
+            connected: true,
+            is_auth_error: false,
+            last_error: None,
+            status_line: "Live · Local PTY".to_string(),
+            parser,
+            cols: DEFAULT_TERM_COLS,
+            rows: DEFAULT_TERM_ROWS,
+            line_height_mult: 1.42,
+            selection: None,
+            selection_mode: TerminalSelectionMode::Char,
+            is_selecting: false,
+            drag_mouse_pos: None,
+            drag_scroll_active: false,
+            hovered_url: None,
+            screen_bounds: Arc::new(Mutex::new(None)),
+            cell_width: Arc::new(Mutex::new(7.8)),
+            last_requested_size: Arc::new(Mutex::new((DEFAULT_TERM_COLS, DEFAULT_TERM_ROWS))),
+            pty_resize_seq: Arc::new(AtomicU64::new(0)),
+            last_pty_size: Arc::new(Mutex::new((DEFAULT_TERM_COLS, DEFAULT_TERM_ROWS))),
+            typed_line: String::new(),
+            recent_output_tail: String::new(),
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            active_match_idx: 0,
+            is_local: true,
+            env_label: Some("LOCAL"),
+            manually_closed: false,
+            reconnect_attempts: 0,
+            transcript_path: None,
+            transcript_file: None,
+        }
+    }
+
+    pub fn start_transcript(&mut self, path: PathBuf) -> Result<(), String> {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| format!("failed to open transcript file: {e}"))?;
+        let header = format!(
+            "\n--- STerm Session Log started {} ({}) ---\n",
+            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
+            self.label
+        );
+        let _ = file.write_all(header.as_bytes());
+        let _ = file.flush();
+        self.transcript_path = Some(path);
+        self.transcript_file = Some(file);
+        Ok(())
+    }
+
+    pub fn stop_transcript(&mut self) {
+        if let Some(mut f) = self.transcript_file.take() {
+            let footer = format!(
+                "\n--- STerm Session Log ended {} ---\n",
+                chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
+            );
+            let _ = f.write_all(footer.as_bytes());
+            let _ = f.flush();
+        }
+        self.transcript_path = None;
     }
 
     pub fn is_alternate_screen(&self) -> bool {
@@ -587,6 +682,17 @@ impl TerminalTab {
         };
 
         self.parser.process(bytes);
+
+        // Append clean ANSI-stripped output to active session transcript log if recording
+        if !bytes.is_empty()
+            && let Some(ref mut log_file) = self.transcript_file
+        {
+            let clean = strip_ansi_for_log(bytes);
+            if !clean.is_empty() {
+                let _ = log_file.write_all(clean.as_bytes());
+                let _ = log_file.flush();
+            }
+        }
 
         // Keep last ~240 chars of UTF-8 output for password-prompt detection in command recording
         if !bytes.is_empty() {
@@ -2061,6 +2167,46 @@ pub fn keystroke_to_vt_bytes(ks: &Keystroke) -> Option<Vec<u8>> {
     }
 }
 
+/// Strips CSI/OSC ANSI escape sequences from raw PTY bytes for clean readable session transcripts.
+pub fn strip_ansi_for_log(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            match chars.peek().copied() {
+                Some('[') => {
+                    chars.next();
+                    for ch in chars.by_ref() {
+                        if ('@'..='~').contains(&ch) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    while let Some(ch) = chars.next() {
+                        if ch == '\x07' {
+                            break;
+                        }
+                        if ch == '\x1b' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
+            }
+        } else if c != '\r' {
+            out.push(c);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2598,5 +2744,12 @@ mod tests {
         tab.clear_buffer();
         assert!(tab.search_matches.is_empty());
         assert!(tab.recent_output_tail.is_empty());
+    }
+
+    #[test]
+    fn strip_ansi_removes_csi_and_osc_for_transcripts() {
+        let raw = b"\x1b[32mhello\x1b[0m \x1b]0;window title\x07world\r\n\x1b[1;31merr\x1b[0m\n";
+        let clean = strip_ansi_for_log(raw);
+        assert_eq!(clean, "hello world\nerr\n");
     }
 }
