@@ -733,7 +733,12 @@ mod tests {
         let mut store = VaultStore::open_in_memory().expect("open");
         assert!(!store.is_initialized().unwrap());
 
-        store.initialize_vault("master-123", false).expect("init");
+        let initial_pw = Uuid::new_v4().to_string();
+        let rotated_pw = Uuid::new_v4().to_string();
+        let wrong_pw = Uuid::new_v4().to_string();
+        let cred_pw = Uuid::new_v4().to_string();
+
+        store.initialize_vault(&initial_pw, false).expect("init");
         assert!(store.is_unlocked());
 
         let host = store
@@ -761,7 +766,7 @@ mod tests {
                 label: "Deploy Key".into(),
                 kind: CredentialKind::Password,
                 username: Some("deploy".into()),
-                password: Some("s3cr3t".into()),
+                password: Some(cred_pw),
                 private_key_pem: None,
                 passphrase: None,
                 certificate_openssh: None,
@@ -773,21 +778,21 @@ mod tests {
 
         store.lock();
         assert!(store.list_hosts().is_err());
-        assert!(store.unlock_with_password("wrong", None).is_err());
+        assert!(store.unlock_with_password(&wrong_pw, None).is_err());
 
         store
-            .unlock_with_password("master-123", None)
+            .unlock_with_password(&initial_pw, None)
             .expect("unlock");
         assert_eq!(store.list_hosts().unwrap().len(), 1);
 
         // Re-key master password
         store
-            .change_master_password("master-123", "new-master-456")
+            .change_master_password(&initial_pw, &rotated_pw)
             .expect("rekey");
         store.lock();
-        assert!(store.unlock_with_password("master-123", None).is_err());
+        assert!(store.unlock_with_password(&initial_pw, None).is_err());
         store
-            .unlock_with_password("new-master-456", None)
+            .unlock_with_password(&rotated_pw, None)
             .expect("unlock new");
         assert_eq!(store.get_host(&host.id).unwrap().hostname, "10.0.0.5");
 

@@ -114,7 +114,8 @@ mod tests {
     #[test]
     fn dek_wrap_and_domain_separation() {
         let salt = generate_salt();
-        let derived = derive_keys("super-secret-passphrase", &salt, &KdfParams::fast_for_tests())
+        let ephemeral_input = format!("kdf-fixture-{salt:02x?}");
+        let derived = derive_keys(&ephemeral_input, &salt, &KdfParams::fast_for_tests())
             .expect("kdf");
 
         assert_ne!(derived.vault_key.as_bytes(), derived.auth_key.as_bytes());

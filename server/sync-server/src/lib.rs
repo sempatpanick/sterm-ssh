@@ -48,10 +48,14 @@ mod tests {
     #[tokio::test]
     async fn end_to_end_zero_knowledge_cross_platform_sync() {
         let db = SyncDb::open_in_memory().expect("db");
+        let jwt_secret = uuid::Uuid::new_v4().to_string();
+        let salt_pepper = uuid::Uuid::new_v4().to_string();
+        let initial_pw = uuid::Uuid::new_v4().to_string();
+        let rotated_pw = uuid::Uuid::new_v4().to_string();
         let state = AppState {
             db: Arc::new(Mutex::new(db)),
-            jwt_secret: "test-jwt-secret-key-32-bytes-long!".into(),
-            salt_pepper: "test-pepper".into(),
+            jwt_secret,
+            salt_pepper,
         };
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -67,9 +71,7 @@ mod tests {
 
         // Device A (Windows) creates local encrypted vault and registers account
         let mut windows_vault = VaultStore::open_in_memory().unwrap();
-        windows_vault
-            .initialize_vault("Correct-Horse-Battery-99!", false)
-            .unwrap();
+        windows_vault.initialize_vault(&initial_pw, false).unwrap();
 
         let kp = generate_ed25519_keypair("ops@sterm", None).unwrap();
         let cred = windows_vault
@@ -102,13 +104,13 @@ mod tests {
                 terminal_theme: Some("obsidian".into()),
                 keepalive_secs: 30,
                 startup_command: None,
-                notes: Some("top-secret-cluster-note".into()),
+                notes: Some("cluster-note-fixture".into()),
                 updated_at: 0,
             })
             .unwrap();
 
         let win_session = client
-            .register(&server_url, "dev@example.com", "Correct-Horse-Battery-99!", &windows_vault)
+            .register(&server_url, "dev@example.com", &initial_pw, &windows_vault)
             .await
             .expect("register");
 
@@ -121,7 +123,7 @@ mod tests {
             let raw_dump = guard.debug_dump_ciphertexts().unwrap();
             assert!(!raw_dump.contains("198.51.100.42"));
             assert!(!raw_dump.contains("Tokyo Production"));
-            assert!(!raw_dump.contains("top-secret-cluster-note"));
+            assert!(!raw_dump.contains("cluster-note-fixture"));
             assert!(!raw_dump.contains("OPENSSH PRIVATE KEY"));
         }
 
@@ -131,7 +133,7 @@ mod tests {
             .login(
                 &server_url,
                 "dev@example.com",
-                "Correct-Horse-Battery-99!",
+                &initial_pw,
                 &mut macos_vault,
                 false,
             )
@@ -167,8 +169,8 @@ mod tests {
         let updated_win_session = client
             .change_password(
                 &win_session,
-                "Correct-Horse-Battery-99!",
-                "Brand-New-Password-2026!",
+                &initial_pw,
+                &rotated_pw,
                 &mut windows_vault,
             )
             .await
@@ -180,7 +182,7 @@ mod tests {
             .login(
                 &server_url,
                 "dev@example.com",
-                "Correct-Horse-Battery-99!",
+                &initial_pw,
                 &mut fresh_macos,
                 false
             )
@@ -191,7 +193,7 @@ mod tests {
             .login(
                 &server_url,
                 "dev@example.com",
-                "Brand-New-Password-2026!",
+                &rotated_pw,
                 &mut fresh_macos,
                 false,
             )
@@ -202,7 +204,7 @@ mod tests {
 
         // Delete account -> subsequent login fails
         client
-            .delete_account(&updated_win_session, "Brand-New-Password-2026!", &mut windows_vault)
+            .delete_account(&updated_win_session, &rotated_pw, &mut windows_vault)
             .await
             .expect("delete account");
         let mut after_del = VaultStore::open_in_memory().unwrap();
@@ -210,7 +212,7 @@ mod tests {
             .login(
                 &server_url,
                 "dev@example.com",
-                "Brand-New-Password-2026!",
+                &rotated_pw,
                 &mut after_del,
                 false
             )

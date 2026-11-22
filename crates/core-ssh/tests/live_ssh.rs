@@ -231,6 +231,7 @@ impl HostKeyVerifier for RejectHostKey {
 }
 
 async fn spawn_test_sshd(
+    allowed_password: String,
     client_pubkey: PublicKey,
     allowed_cert_ca: Option<PublicKey>,
     allowed_kbi_code: Option<String>,
@@ -244,7 +245,7 @@ async fn spawn_test_sshd(
     let port = listener.local_addr().unwrap().port();
 
     let mut srv = EchoSshServer {
-        allowed_password: "secret-pass".into(),
+        allowed_password,
         allowed_pubkey: client_pubkey,
         allowed_cert_ca,
         allowed_kbi_code,
@@ -286,7 +287,8 @@ async fn live_ssh_password_pubkey_pty_resize_and_tofu() {
         .to_openssh(ssh_key::LineEnding::LF)
         .unwrap()
         .to_string();
-    let port = spawn_test_sshd(client_key.public_key().clone(), None, None).await;
+    let test_pw = format!("ssh-fixture-{}", rand::random::<u64>());
+    let port = spawn_test_sshd(test_pw.clone(), client_key.public_key().clone(), None, None).await;
 
     let mgr = SshSessionManager::new();
 
@@ -300,7 +302,7 @@ async fn live_ssh_password_pubkey_pty_resize_and_tofu() {
                     port,
                     username: "tester".into(),
                     auth: SshAuthMethod::Password {
-                        password: "secret-pass".into(),
+                        password: test_pw,
                     },
                     keepalive_secs: 0,
                 },
@@ -389,10 +391,12 @@ async fn live_ssh_certificate_and_keyboard_interactive_auth() {
     let cert = builder.sign(&ca_key).unwrap();
     let cert_openssh = cert.to_openssh().unwrap();
 
+    let otp_code = format!("{:06}", rand::random::<u32>() % 1_000_000);
     let port = spawn_test_sshd(
+        format!("ssh-fixture-{}", rand::random::<u64>()),
         user_key.public_key().clone(),
         Some(ca_key.public_key().clone()),
-        Some("482910".into()),
+        Some(otp_code.clone()),
     )
     .await;
 
@@ -441,9 +445,7 @@ async fn live_ssh_certificate_and_keyboard_interactive_auth() {
                 rows: 24,
                 startup_command: None,
             },
-            Arc::new(KbiAutoResponder {
-                code: "482910".into(),
-            }),
+            Arc::new(KbiAutoResponder { code: otp_code }),
             |_| {},
         )
         .await
@@ -454,7 +456,8 @@ async fn live_ssh_certificate_and_keyboard_interactive_auth() {
 #[tokio::test]
 async fn live_ssh_rekey_and_keepalive_stays_connected() {
     let client_key = PrivateKey::random(&mut test_rng(), Algorithm::Ed25519).unwrap();
-    let port = spawn_test_sshd(client_key.public_key().clone(), None, None).await;
+    let test_pw = format!("ssh-fixture-{}", rand::random::<u64>());
+    let port = spawn_test_sshd(test_pw.clone(), client_key.public_key().clone(), None, None).await;
 
     let mgr = SshSessionManager::new();
     let (tx, mut rx) = mpsc::unbounded_channel::<TerminalEvent>();
@@ -466,9 +469,7 @@ async fn live_ssh_rekey_and_keepalive_stays_connected() {
                     hostname: "127.0.0.1".into(),
                     port,
                     username: "tester".into(),
-                    auth: SshAuthMethod::Password {
-                        password: "secret-pass".into(),
-                    },
+                    auth: SshAuthMethod::Password { password: test_pw },
                     keepalive_secs: 1,
                 },
                 cols: 80,
