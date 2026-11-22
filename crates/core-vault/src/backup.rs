@@ -141,8 +141,13 @@ mod tests {
 
     #[test]
     fn encrypted_backup_export_and_restore() {
+        let src_pw = uuid::Uuid::new_v4().to_string();
+        let dst_pw = uuid::Uuid::new_v4().to_string();
+        let archive_pw = uuid::Uuid::new_v4().to_string();
+        let wrong_pw = uuid::Uuid::new_v4().to_string();
+
         let mut src = VaultStore::open_in_memory().unwrap();
-        src.initialize_vault("src-pw", false).unwrap();
+        src.initialize_vault(&src_pw, false).unwrap();
         src.upsert_host(HostRecord {
             id: String::new(),
             label: "Edge".into(),
@@ -162,16 +167,16 @@ mod tests {
         .unwrap();
 
         let tmp = std::env::temp_dir().join("sterm-test-backup.sterm-vault");
-        export_encrypted_backup(&src, "backup-secret", &tmp).unwrap();
+        export_encrypted_backup(&src, &archive_pw, &tmp).unwrap();
 
         let mut dst = VaultStore::open_in_memory().unwrap();
-        dst.initialize_vault("dst-pw", false).unwrap();
+        dst.initialize_vault(&dst_pw, false).unwrap();
 
         // Wrong backup password fails
-        assert!(import_encrypted_backup(&dst, "wrong", &tmp).is_err());
+        assert!(import_encrypted_backup(&dst, &wrong_pw, &tmp).is_err());
 
         // Correct password restores
-        let rep = import_encrypted_backup(&dst, "backup-secret", &tmp).unwrap();
+        let rep = import_encrypted_backup(&dst, &archive_pw, &tmp).unwrap();
         assert_eq!(rep.hosts, 1);
         assert_eq!(dst.list_hosts().unwrap()[0].hostname, "edge.internal");
 

@@ -97,15 +97,17 @@ mod tests {
 
     #[test]
     fn generates_and_inspects_ed25519_keypair() {
-        let kp = generate_ed25519_keypair("test@sterm", Some("pass123")).expect("keygen");
+        let phrase = format!("keygen-fixture-{:02x?}", crate::kdf::generate_salt());
+        let other_phrase = format!("keygen-other-{:02x?}", crate::kdf::generate_salt());
+        let kp = generate_ed25519_keypair("test@sterm", Some(&phrase)).expect("keygen");
         assert!(kp.public_key_openssh.starts_with("ssh-ed25519 "));
         assert!(kp.fingerprint_sha256.starts_with("SHA256:"));
 
         let (pub_k, fp) =
-            inspect_private_key(&kp.private_key_openssh, Some("pass123")).expect("inspect");
+            inspect_private_key(&kp.private_key_openssh, Some(&phrase)).expect("inspect");
         assert_eq!(pub_k, kp.public_key_openssh);
         assert_eq!(fp, kp.fingerprint_sha256);
 
-        assert!(inspect_private_key(&kp.private_key_openssh, Some("wrong")).is_err());
+        assert!(inspect_private_key(&kp.private_key_openssh, Some(&other_phrase)).is_err());
     }
 }
