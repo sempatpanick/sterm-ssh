@@ -1776,11 +1776,12 @@ impl TerminalTab {
                 }
 
                 if let Some(cell) = cell {
-                    let mut fg = vt_color_to_hsla(cell.fgcolor(), term_fg);
                     let mut bg = match cell.bgcolor() {
                         vt100::Color::Default => None,
-                        other => Some(vt_color_to_hsla(other, term_bg)),
+                        other => Some(vt_color_to_hsla(other, term_bg, false)),
                     };
+                    let effective_light_bg = bg.unwrap_or(term_bg).l > 0.55;
+                    let mut fg = vt_color_to_hsla(cell.fgcolor(), term_fg, effective_light_bg);
 
                     if cell.inverse() {
                         let old_fg = fg;
@@ -1797,7 +1798,7 @@ impl TerminalTab {
 
                     if is_selected {
                         if cell.inverse() && cell.bgcolor() == vt100::Color::Default {
-                            fg = vt_color_to_hsla(cell.fgcolor(), term_fg);
+                            fg = vt_color_to_hsla(cell.fgcolor(), term_fg, effective_light_bg);
                         }
                         bg = Some(sel_bg);
                     }
@@ -1964,16 +1965,17 @@ impl TerminalTab {
 
         div()
             .relative()
+            .size_full()
             .flex_1()
             .min_h_0()
             .min_w_0()
-            .w_full()
             .overflow_hidden()
             .flex()
             .flex_col()
+            .bg(term_bg)
             .font_family(font_family.to_string())
             .text_size(px(font_size))
-            .text_color(t.terminal_fg)
+            .text_color(term_fg)
             .children(row_elements)
             .child(metrics_tracker)
     }
