@@ -7,6 +7,7 @@ use crate::local_shell::LocalShellManager;
 use crate::motion::animate_modal_enter;
 use crate::text_field::TextField;
 use crate::theme::{TerminalThemeId, ThemeMode, ThemePalette};
+use crate::tooltip::StermTooltip;
 
 impl StermAdminApp {
     pub fn render_modal(
@@ -3426,6 +3427,7 @@ impl StermAdminApp {
                     .text_color(t.text_muted)
                     .cursor_pointer()
                     .hover(|s| s.bg(t.bg_subtle).text_color(t.text_primary))
+                    .tooltip(StermTooltip::with_shortcut("Close", "Esc", *t))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.modal = None;
                         cx.notify();

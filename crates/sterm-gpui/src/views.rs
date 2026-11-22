@@ -18,6 +18,7 @@ use crate::sftp::{
 };
 use crate::split_tree::{SplitDirection, SplitNode};
 use crate::theme::{env_badge_for_host, format_bytes, TerminalThemeId, ThemePalette};
+use crate::tooltip::StermTooltip;
 
 impl StermAdminApp {
     // =========================================================================
@@ -688,6 +689,7 @@ impl StermAdminApp {
                                                 .rounded_sm()
                                                 .text_size(px(10.0))
                                                 .hover(|s| s.bg(t.bg_card))
+                                                .tooltip(StermTooltip::text("Edit Group", *t))
                                                 .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                                     cx.stop_propagation();
                                                 })
@@ -955,6 +957,14 @@ impl StermAdminApp {
                                                                         .id(("hc-fav", ix))
                                                                         .text_xs()
                                                                         .cursor_pointer()
+                                                                        .tooltip(StermTooltip::text(
+                                                                            if h.favorite {
+                                                                                "Remove from Favorites"
+                                                                            } else {
+                                                                                "Pin to Favorites"
+                                                                            },
+                                                                            *t,
+                                                                        ))
                                                                         .text_color(if h.favorite {
                                                                             t.warning
                                                                         } else {
@@ -1228,6 +1238,10 @@ impl StermAdminApp {
                                                                     s.bg(t.danger_soft)
                                                                         .text_color(t.danger)
                                                                 })
+                                                                .tooltip(StermTooltip::text(
+                                                                    "Delete Host",
+                                                                    *t,
+                                                                ))
                                                                 .on_click(cx.listener(
                                                                     move |this, _, _, cx| {
                                                                         this.request_confirm(
@@ -1381,6 +1395,14 @@ impl StermAdminApp {
                                                     .text_xs()
                                                     .flex_shrink_0()
                                                     .cursor_pointer()
+                                                    .tooltip(StermTooltip::text(
+                                                        if h.favorite {
+                                                            "Remove from Favorites"
+                                                        } else {
+                                                            "Pin to Favorites"
+                                                        },
+                                                        *t,
+                                                    ))
                                                     .text_color(if h.favorite {
                                                         t.warning
                                                     } else {
@@ -1702,6 +1724,7 @@ impl StermAdminApp {
                                                     .hover(|s| {
                                                         s.bg(t.danger_soft).text_color(t.danger)
                                                     })
+                                                    .tooltip(StermTooltip::text("Delete Host", *t))
                                                     .on_click(cx.listener(
                                                         move |this, _, _, cx| {
                                                             this.request_confirm(
@@ -1855,6 +1878,7 @@ impl StermAdminApp {
                                         .text_color(t.text_muted)
                                         .cursor_pointer()
                                         .hover(|s| s.text_color(t.accent))
+                                        .tooltip(StermTooltip::text("Shrink Left Pane", *t))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.adjust_split_ratio(
                                                 &ws_dec,
@@ -1872,6 +1896,7 @@ impl StermAdminApp {
                                         .text_color(t.text_muted)
                                         .cursor_pointer()
                                         .hover(|s| s.text_color(t.accent))
+                                        .tooltip(StermTooltip::text("Expand Left Pane", *t))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.adjust_split_ratio(
                                                 &ws_inc,
@@ -1910,6 +1935,7 @@ impl StermAdminApp {
                                         .text_color(t.text_muted)
                                         .cursor_pointer()
                                         .hover(|s| s.text_color(t.accent))
+                                        .tooltip(StermTooltip::text("Shrink Top Pane", *t))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.adjust_split_ratio(
                                                 &ws_dec,
@@ -1927,6 +1953,7 @@ impl StermAdminApp {
                                         .text_color(t.text_muted)
                                         .cursor_pointer()
                                         .hover(|s| s.text_color(t.accent))
+                                        .tooltip(StermTooltip::text("Expand Top Pane", *t))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.adjust_split_ratio(
                                                 &ws_inc,
@@ -2169,6 +2196,11 @@ impl StermAdminApp {
                                     .justify_center()
                                     .cursor_pointer()
                                     .hover(|s| s.bg(t.bg_hover))
+                                    .tooltip(StermTooltip::with_shortcut(
+                                        "Command Suggestions",
+                                        "Ctrl+Space",
+                                        *t,
+                                    ))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.suggestions_manual_open =
                                             !this.suggestions_manual_open;
@@ -2197,6 +2229,11 @@ impl StermAdminApp {
                                     .justify_center()
                                     .cursor_pointer()
                                     .hover(|s| s.bg(t.bg_hover))
+                                    .tooltip(StermTooltip::with_shortcut(
+                                        "Find in Terminal",
+                                        "Ctrl+F",
+                                        *t,
+                                    ))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.term_search_open = !this.term_search_open;
                                         cx.notify();
@@ -2228,6 +2265,14 @@ impl StermAdminApp {
                                     .justify_center()
                                     .cursor_pointer()
                                     .hover(|s| s.bg(t.bg_hover))
+                                    .tooltip(StermTooltip::text(
+                                        if broadcast_input {
+                                            "Disable Broadcast Input"
+                                        } else {
+                                            "Broadcast Input to All Panes"
+                                        },
+                                        *t,
+                                    ))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.toggle_broadcast_input(&ws_bcast, cx);
                                     }))
@@ -2258,6 +2303,14 @@ impl StermAdminApp {
                                     .justify_center()
                                     .cursor_pointer()
                                     .hover(|s| s.bg(t.bg_hover))
+                                    .tooltip(StermTooltip::text(
+                                        if is_recording {
+                                            "Stop Recording Transcript"
+                                        } else {
+                                            "Record Session Transcript (.log)"
+                                        },
+                                        *t,
+                                    ))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.toggle_pane_transcript(pid_log.clone(), cx);
                                     }))
@@ -2334,6 +2387,10 @@ impl StermAdminApp {
                                         .justify_center()
                                         .cursor_pointer()
                                         .hover(|s| s.bg(t.bg_hover))
+                                        .tooltip(StermTooltip::text(
+                                            "Rotate SSH Session Keys (Rekey)",
+                                            *t,
+                                        ))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.rekey_terminal_pane(pid_rekey.clone(), cx);
                                         }))
@@ -2355,6 +2412,14 @@ impl StermAdminApp {
                                         .justify_center()
                                         .cursor_pointer()
                                         .hover(|s| s.bg(t.bg_hover))
+                                        .tooltip(StermTooltip::text(
+                                            if self.sftp_drawer_open {
+                                                "Hide SFTP Drawer"
+                                            } else {
+                                                "Toggle Docked SFTP Drawer"
+                                            },
+                                            *t,
+                                        ))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.toggle_sftp_drawer(&pid_drawer, cx);
                                         }))
@@ -2402,6 +2467,11 @@ impl StermAdminApp {
                                     .justify_center()
                                     .cursor_pointer()
                                     .hover(|s| s.bg(t.bg_hover))
+                                    .tooltip(StermTooltip::with_shortcut(
+                                        "Split Pane Horizontally",
+                                        "Ctrl+D",
+                                        *t,
+                                    ))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.split_pane_duplicate_or_host(
                                             ws_spl_h.clone(),
@@ -2425,6 +2495,11 @@ impl StermAdminApp {
                                     .justify_center()
                                     .cursor_pointer()
                                     .hover(|s| s.bg(t.bg_hover))
+                                    .tooltip(StermTooltip::with_shortcut(
+                                        "Split Pane Vertically",
+                                        "Ctrl+Shift+D",
+                                        *t,
+                                    ))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.split_pane_duplicate_or_host(
                                             ws_spl_v.clone(),
@@ -2490,6 +2565,10 @@ impl StermAdminApp {
                                         .justify_center()
                                         .cursor_pointer()
                                         .hover(|s| s.bg(t.bg_hover))
+                                        .tooltip(StermTooltip::text(
+                                            "Reconnect SSH Session",
+                                            *t,
+                                        ))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.reconnect_terminal_pane(
                                                 pid_reconn.clone(),
@@ -2512,6 +2591,7 @@ impl StermAdminApp {
                                     .justify_center()
                                     .cursor_pointer()
                                     .hover(|s| s.bg(t.danger_soft))
+                                    .tooltip(StermTooltip::text("Close Pane", *t))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.close_pane_in_workspace(
                                             ws_close.clone(),
@@ -2634,6 +2714,7 @@ impl StermAdminApp {
                                         .text_xs()
                                         .cursor_pointer()
                                         .hover(|s| s.bg(t.bg_subtle))
+                                        .tooltip(StermTooltip::text("Previous Match", *t))
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.step_terminal_search(false, cx);
                                         }))
@@ -2648,6 +2729,7 @@ impl StermAdminApp {
                                         .text_xs()
                                         .cursor_pointer()
                                         .hover(|s| s.bg(t.bg_subtle))
+                                        .tooltip(StermTooltip::text("Next Match", *t))
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.step_terminal_search(true, cx);
                                         }))
@@ -2663,6 +2745,11 @@ impl StermAdminApp {
                                         .text_color(t.text_muted)
                                         .cursor_pointer()
                                         .hover(|s| s.bg(t.danger_soft).text_color(t.danger))
+                                        .tooltip(StermTooltip::with_shortcut(
+                                            "Close Search",
+                                            "Esc",
+                                            *t,
+                                        ))
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.term_search_open = false;
                                             cx.notify();
@@ -2789,6 +2876,14 @@ impl StermAdminApp {
                                                         t.text_muted
                                                     })
                                                     .hover(|s| s.bg(t.bg_hover))
+                                                    .tooltip(StermTooltip::text(
+                                                        if item.pinned {
+                                                            "Unpin Snippet"
+                                                        } else {
+                                                            "Pin as Snippet"
+                                                        },
+                                                        *t,
+                                                    ))
                                                     .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                                         cx.stop_propagation();
                                                     })
@@ -2813,6 +2908,11 @@ impl StermAdminApp {
                                                     .bg(t.accent_solid)
                                                     .text_color(gpui::white())
                                                     .text_size(px(10.0))
+                                                    .tooltip(StermTooltip::with_shortcut(
+                                                        "Run Command",
+                                                        "Alt+Enter",
+                                                        *t,
+                                                    ))
                                                     .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                                         cx.stop_propagation();
                                                     })
@@ -2997,6 +3097,7 @@ impl StermAdminApp {
                                     .text_xs()
                                     .cursor_pointer()
                                     .hover(|s| s.bg(t.bg_hover))
+                                    .tooltip(StermTooltip::text("Parent Directory", *t))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.navigate_remote_up();
                                         cx.notify();
@@ -3016,6 +3117,7 @@ impl StermAdminApp {
                                     .justify_center()
                                     .cursor_pointer()
                                     .hover(|s| s.bg(t.bg_hover))
+                                    .tooltip(StermTooltip::text("Refresh Remote Directory", *t))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         let cur = this.sftp_state.remote_path.clone();
                                         this.refresh_remote_dir(cur);
@@ -3051,6 +3153,7 @@ impl StermAdminApp {
                                     .justify_center()
                                     .cursor_pointer()
                                     .hover(|s| s.bg(t.danger_soft))
+                                    .tooltip(StermTooltip::text("Close SFTP Drawer", *t))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.sftp_drawer_open = false;
                                         cx.notify();
@@ -3142,6 +3245,14 @@ impl StermAdminApp {
                                             .bg(t.accent_soft)
                                             .text_size(px(10.0))
                                             .text_color(t.accent)
+                                            .tooltip(StermTooltip::text(
+                                                if is_dir {
+                                                    "Download Folder"
+                                                } else {
+                                                    "Download File"
+                                                },
+                                                *t,
+                                            ))
                                             .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                                 cx.stop_propagation();
                                             })
@@ -3398,6 +3509,7 @@ impl StermAdminApp {
                                             .text_xs()
                                             .cursor_pointer()
                                             .hover(|s| s.bg(t.bg_hover))
+                                            .tooltip(StermTooltip::text("Parent Directory", *t))
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.navigate_local_up();
                                                 cx.notify();
@@ -3442,6 +3554,7 @@ impl StermAdminApp {
                                             .text_xs()
                                             .cursor_pointer()
                                             .hover(|s| s.bg(t.bg_hover))
+                                            .tooltip(StermTooltip::text("Refresh Left Pane", *t))
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 let cur = this.sftp_state.local_path.clone();
                                                 this.refresh_left_pane(cur);
@@ -3701,6 +3814,16 @@ impl StermAdminApp {
                                                                             .bg(t_local.accent_soft)
                                                                             .text_size(px(10.0))
                                                                             .text_color(t_local.accent)
+                                                                            .tooltip(StermTooltip::text(
+                                                                                if left_is_remote {
+                                                                                    "Copy to Right Host"
+                                                                                } else if is_dir {
+                                                                                    "Upload Folder"
+                                                                                } else {
+                                                                                    "Upload File"
+                                                                                },
+                                                                                t_local,
+                                                                            ))
                                                                             .on_mouse_down(
                                                                                 MouseButton::Left,
                                                                                 |_, _, cx| {
@@ -3780,6 +3903,7 @@ impl StermAdminApp {
                                             .text_xs()
                                             .cursor_pointer()
                                             .hover(|s| s.bg(t.bg_hover))
+                                            .tooltip(StermTooltip::text("Parent Directory", *t))
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.navigate_remote_up();
                                                 cx.notify();
@@ -3825,6 +3949,10 @@ impl StermAdminApp {
                                             .text_xs()
                                             .cursor_pointer()
                                             .hover(|s| s.bg(t.bg_hover))
+                                            .tooltip(StermTooltip::text(
+                                                "Refresh Remote Directory",
+                                                *t,
+                                            ))
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 let cur = this.sftp_state.remote_path.clone();
                                                 this.refresh_remote_dir(cur);
@@ -4087,6 +4215,16 @@ impl StermAdminApp {
                                                                             .text_color(
                                                                                 t_remote.accent,
                                                                             )
+                                                                            .tooltip(StermTooltip::text(
+                                                                                if left_is_remote {
+                                                                                    "Copy to Left Host"
+                                                                                } else if is_dir {
+                                                                                    "Download Folder"
+                                                                                } else {
+                                                                                    "Download File"
+                                                                                },
+                                                                                t_remote,
+                                                                            ))
                                                                             .on_mouse_down(
                                                                                 MouseButton::Left,
                                                                                 |_, _, cx| {
@@ -4224,6 +4362,14 @@ impl StermAdminApp {
                                                                                             .danger,
                                                                                     )
                                                                             })
+                                                                            .tooltip(StermTooltip::text(
+                                                                                if is_dir {
+                                                                                    "Delete Remote Folder"
+                                                                                } else {
+                                                                                    "Delete Remote File"
+                                                                                },
+                                                                                t_remote,
+                                                                            ))
                                                                             .on_mouse_down(
                                                                                 MouseButton::Left,
                                                                                 |_, _, cx| {
@@ -4569,6 +4715,14 @@ impl StermAdminApp {
                                             })
                                             .cursor_pointer()
                                             .hover(|s| s.bg(t.bg_card))
+                                            .tooltip(StermTooltip::text(
+                                                if rec.pinned {
+                                                    "Unpin Snippet"
+                                                } else {
+                                                    "Pin to Snippets"
+                                                },
+                                                *t,
+                                            ))
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 let mut updated = rec_pin.clone();
                                                 updated.pinned = !updated.pinned;
@@ -4617,6 +4771,7 @@ impl StermAdminApp {
                                             .text_color(t.text_muted)
                                             .cursor_pointer()
                                             .hover(|s| s.bg(t.danger_soft).text_color(t.danger))
+                                            .tooltip(StermTooltip::text("Delete Command", *t))
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 this.request_confirm(
                                                     ConfirmAction::DeleteCommand {
@@ -5107,6 +5262,10 @@ impl StermAdminApp {
                                                         .hover(|s| {
                                                             s.bg(t.danger_soft).text_color(t.danger)
                                                         })
+                                                        .tooltip(StermTooltip::text(
+                                                            "Delete Tunnel",
+                                                            *t,
+                                                        ))
                                                         .on_click(cx.listener(
                                                             move |this, _, _, cx| {
                                                                 this.request_confirm(
@@ -5530,6 +5689,10 @@ impl StermAdminApp {
                                                     .hover(|s| {
                                                         s.bg(t.danger_soft).text_color(t.danger)
                                                     })
+                                                    .tooltip(StermTooltip::text(
+                                                        "Delete Credential",
+                                                        *t,
+                                                    ))
                                                     .on_click(cx.listener(
                                                         move |this, _, _, cx| {
                                                             this.request_confirm(
@@ -5837,6 +6000,7 @@ impl StermAdminApp {
                                     .text_xs()
                                     .text_color(t.text_muted)
                                     .cursor_pointer()
+                                    .tooltip(StermTooltip::text("Close Transfer Panel", *t))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.island_open = false;
                                         cx.notify();

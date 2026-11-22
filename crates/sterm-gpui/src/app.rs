@@ -62,6 +62,7 @@ use crate::terminal::{
 };
 use crate::text_field::{TextField, TextFieldEvent};
 use crate::theme::{env_badge_for_host, ThemeMode, ThemePalette, UiSettings};
+use crate::tooltip::StermTooltip;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdminPage {
@@ -6339,6 +6340,14 @@ impl Render for StermAdminApp {
                                     .justify_center()
                                     .cursor_pointer()
                                     .hover(|s| s.bg(t.bg_hover).text_color(t.text_primary))
+                                    .tooltip(StermTooltip::text(
+                                        if collapsed {
+                                            "Expand Sidebar"
+                                        } else {
+                                            "Collapse Sidebar"
+                                        },
+                                        t,
+                                    ))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.toggle_sidebar(cx);
                                     }))
@@ -6362,6 +6371,13 @@ impl Render for StermAdminApp {
                             .justify_between()
                             .cursor_pointer()
                             .hover(|s| s.border_color(t.accent).text_color(t.text_primary))
+                            .when(collapsed, |el| {
+                                el.tooltip(StermTooltip::with_shortcut(
+                                    "Quick Connect & Omnibar",
+                                    "Ctrl+K",
+                                    t,
+                                ))
+                            })
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.open_command_palette(cx);
                             }))
@@ -6413,6 +6429,7 @@ impl Render for StermAdminApp {
                                     s.bg(t.bg_subtle).text_color(t.text_primary)
                                 }
                             })
+                            .when(collapsed, |el| el.tooltip(StermTooltip::text(label, t)))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.navigate_to(target, cx);
                             }))
@@ -6481,6 +6498,16 @@ impl Render for StermAdminApp {
                             .justify_between()
                             .cursor_pointer()
                             .hover(|s| s.bg(t.bg_hover))
+                            .when(collapsed, |el| {
+                                el.tooltip(StermTooltip::text(
+                                    if self.sync_status.signed_in {
+                                        "E2EE Sync (Connected)"
+                                    } else {
+                                        "Local Vault (Offline)"
+                                    },
+                                    t,
+                                ))
+                            })
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.settings_tab = SettingsTab::Account;
                                 this.navigate_to(AdminPage::Settings, cx);
@@ -6560,6 +6587,7 @@ impl Render for StermAdminApp {
                                     s.bg(t.bg_subtle).text_color(t.text_primary)
                                 }
                             })
+                            .when(collapsed, |el| el.tooltip(StermTooltip::text("Settings", t)))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.navigate_to(AdminPage::Settings, cx);
                             }))
@@ -6591,6 +6619,13 @@ impl Render for StermAdminApp {
                             .text_color(t.text_muted)
                             .cursor_pointer()
                             .hover(|s| s.bg(t.danger_soft).text_color(t.danger))
+                            .when(collapsed, |el| {
+                                el.tooltip(StermTooltip::with_shortcut(
+                                    "Lock Vault",
+                                    "Ctrl+Shift+L",
+                                    t,
+                                ))
+                            })
                             .on_click(cx.listener(|this, _, _, cx| this.lock_vault(cx)))
                             .child(icon_svg(Icon::Lock, 14.0, t.text_muted))
                             .when(!collapsed, |el| {
@@ -6765,6 +6800,11 @@ impl Render for StermAdminApp {
                                     .text_size(px(10.0))
                                     .text_color(t.text_muted)
                                     .hover(|s| s.bg(t.danger_soft).text_color(t.danger))
+                                    .tooltip(StermTooltip::with_shortcut(
+                                        "Close Tab",
+                                        "Ctrl+W",
+                                        t,
+                                    ))
                                     .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                         cx.stop_propagation();
                                     })
@@ -6785,6 +6825,7 @@ impl Render for StermAdminApp {
                             .text_color(t.text_muted)
                             .cursor_pointer()
                             .hover(|s| s.bg(t.bg_subtle).text_color(t.text_primary))
+                            .tooltip(StermTooltip::text("Quick SSH Connect", t))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.open_quick_connect_modal(cx);
                             }))
@@ -6953,6 +6994,7 @@ impl Render for StermAdminApp {
                                         .id("dismiss-toast")
                                         .px_1p5()
                                         .cursor_pointer()
+                                        .tooltip(StermTooltip::text("Dismiss Notification", t))
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.toast = None;
                                             cx.notify();

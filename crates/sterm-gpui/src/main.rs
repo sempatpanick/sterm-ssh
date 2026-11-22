@@ -11,6 +11,7 @@ mod split_tree;
 mod terminal;
 mod text_field;
 mod theme;
+mod tooltip;
 mod views;
 
 use gpui::{
