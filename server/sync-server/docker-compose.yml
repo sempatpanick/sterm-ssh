@@ -1,0 +1,20 @@
+services:
+  sterm-sync-server:
+    build:
+      context: ../..
+      dockerfile: server/sync-server/Dockerfile
+    container_name: sterm-sync-server
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    environment:
+      STERM_SYNC_BIND: "0.0.0.0:8787"
+      STERM_SYNC_DB: "/data/sterm-sync.db"
+      STERM_JWT_SECRET: "${STERM_JWT_SECRET:-replace-with-32-byte-random-secret}"
+      STERM_SALT_PEPPER: "${STERM_SALT_PEPPER:-replace-with-32-byte-random-pepper}"
+      RUST_LOG: "info"
+    volumes:
+      - sterm-sync-data:/data
+
+volumes:
+  sterm-sync-data:

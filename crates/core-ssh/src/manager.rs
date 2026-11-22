@@ -1,0 +1,813 @@
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use dashmap::DashMap;
+use russh::client::{self, DisconnectReason, Handle, KeyboardInteractiveAuthResponse};
+use russh::keys::{
+    agent::{
+        client::{AgentClient, AgentStream},
+        AgentIdentity,
+    },
+    decode_secret_key,
+    key::PrivateKeyWithHashAlg,
+    Certificate, HashAlg, PublicKeyBase64, PublicKeyOrCertificate,
+};
+use russh::{ChannelMsg, ChannelStream};
+use socket2::{SockRef, TcpKeepalive};
+use tokio::sync::{mpsc, oneshot};
+use tracing::{debug, warn};
+use uuid::Uuid;
+
+use crate::types::{
+    ConnectRequest, HostKeyChallenge, HostKeyStatus, KeyboardInteractiveChallenge,
+    KeyboardInteractivePrompt, SshAuthMethod, SshTarget, TerminalEvent,
+};
+use crate::{SshError, SshResult};
+
+/// Callback bridge between the pure-Rust SSH engine and the Vault + UI prompts.
+#[async_trait]
+pub trait HostKeyVerifier: Send + Sync {
+    /// Returns the stored SHA-256 fingerprint for `(hostname, port)` if previously trusted.
+    async fn lookup_known_host(&self, hostname: &str, port: u16) -> Option<String>;
+
+    /// Prompts the user to verify an unknown or changed host key; returns true if accepted.
+    async fn prompt_user(&self, challenge: HostKeyChallenge) -> bool;
+
+    /// Persists an accepted host key in the vault.
+    async fn save_known_host(&self, challenge: HostKeyChallenge);
+
+    /// Prompts the user to answer a keyboard-interactive (PAM / 2FA / TOTP) challenge.
+    /// Returns `None` if cancelled or unsupported.
+    async fn prompt_keyboard_interactive(
+        &self,
+        _challenge: KeyboardInteractiveChallenge,
+    ) -> Option<Vec<String>> {
+        None
+    }
+}
+
+/// Auto-accept verifier strictly for automated integration tests.
+pub struct AcceptAllHostKeys;
+
+#[async_trait]
+impl HostKeyVerifier for AcceptAllHostKeys {
+    async fn lookup_known_host(&self, _hostname: &str, _port: u16) -> Option<String> {
+        None
+    }
+    async fn prompt_user(&self, _challenge: HostKeyChallenge) -> bool {
+        true
+    }
+    async fn save_known_host(&self, _challenge: HostKeyChallenge) {}
+}
+
+struct StermClientHandler {
+    hostname: String,
+    port: u16,
+    verifier: Arc<dyn HostKeyVerifier>,
+    disconnect_reason: Arc<Mutex<Option<String>>>,
+}
+
+impl client::Handler for StermClientHandler {
+    type Error = russh::Error;
+
+    async fn check_server_key(
+        &mut self,
+        server_public_key: &PublicKeyOrCertificate,
+    ) -> Result<bool, Self::Error> {
+        let server_key = server_public_key.public_key();
+        let fingerprint = server_key.fingerprint(HashAlg::Sha256).to_string();
+        let algorithm = server_key.algorithm().to_string();
+        let public_key_b64 = B64.encode(server_key.public_key_bytes());
+
+        if let Some(expected) = self
+            .verifier
+            .lookup_known_host(&self.hostname, self.port)
+            .await
+        {
+            if expected == fingerprint {
+                return Ok(true);
+            }
+            let challenge = HostKeyChallenge {
+                challenge_id: Uuid::now_v7().to_string(),
+                hostname: self.hostname.clone(),
+                port: self.port,
+                algorithm,
+                fingerprint_sha256: fingerprint,
+                public_key_b64,
+                status: HostKeyStatus::Mismatch {
+                    expected_fingerprint: expected,
+                },
+            };
+            let accepted = self.verifier.prompt_user(challenge.clone()).await;
+            if accepted {
+                self.verifier.save_known_host(challenge).await;
+            }
+            return Ok(accepted);
+        }
+
+        let challenge = HostKeyChallenge {
+            challenge_id: Uuid::now_v7().to_string(),
+            hostname: self.hostname.clone(),
+            port: self.port,
+            algorithm,
+            fingerprint_sha256: fingerprint,
+            public_key_b64,
+            status: HostKeyStatus::Unknown,
+        };
+        let accepted = self.verifier.prompt_user(challenge.clone()).await;
+        if accepted {
+            self.verifier.save_known_host(challenge).await;
+        }
+        Ok(accepted)
+    }
+
+    async fn disconnected(
+        &mut self,
+        reason: DisconnectReason<Self::Error>,
+    ) -> Result<(), Self::Error> {
+        match reason {
+            DisconnectReason::ReceivedDisconnect(info) => {
+                let msg = if info.message.trim().is_empty() {
+                    format!("remote disconnected ({:?})", info.reason_code)
+                } else {
+                    format!("remote disconnected: {}", info.message.trim())
+                };
+                warn!("SSH disconnected {}:{}: {msg}", self.hostname, self.port);
+                if let Ok(mut guard) = self.disconnect_reason.lock() {
+                    *guard = Some(msg);
+                }
+                Ok(())
+            }
+            DisconnectReason::Error(e) => {
+                let msg = format!("connection lost: {e}");
+                warn!("SSH transport error {}:{}: {e}", self.hostname, self.port);
+                if let Ok(mut guard) = self.disconnect_reason.lock() {
+                    *guard = Some(msg);
+                }
+                Err(e)
+            }
+        }
+    }
+}
+
+enum ShellControl {
+    Input(Vec<u8>),
+    Resize { cols: u32, rows: u32 },
+    Close,
+}
+
+struct ActiveSession {
+    handle: Arc<Handle<StermClientHandler>>,
+    /// Keep jump host handles alive for the lifetime of the tunneled session.
+    _jump_handles: Vec<Handle<StermClientHandler>>,
+    shell_tx: Option<mpsc::Sender<ShellControl>>,
+}
+
+pub struct SshSessionManager {
+    sessions: Arc<DashMap<String, ActiveSession>>,
+    pending_challenges: DashMap<String, oneshot::Sender<bool>>,
+    pending_kbi_challenges: DashMap<String, oneshot::Sender<Option<Vec<String>>>>,
+}
+
+impl Default for SshSessionManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SshSessionManager {
+    pub fn new() -> Self {
+        Self {
+            sessions: Arc::new(DashMap::new()),
+            pending_challenges: DashMap::new(),
+            pending_kbi_challenges: DashMap::new(),
+        }
+    }
+
+    pub fn register_challenge(&self, challenge_id: String) -> oneshot::Receiver<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.pending_challenges.insert(challenge_id, tx);
+        rx
+    }
+
+    pub fn resolve_challenge(&self, challenge_id: &str, accepted: bool) -> bool {
+        if let Some((_, tx)) = self.pending_challenges.remove(challenge_id) {
+            let _ = tx.send(accepted);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn register_kbi_challenge(
+        &self,
+        challenge_id: String,
+    ) -> oneshot::Receiver<Option<Vec<String>>> {
+        let (tx, rx) = oneshot::channel();
+        self.pending_kbi_challenges.insert(challenge_id, tx);
+        rx
+    }
+
+    pub fn resolve_kbi_challenge(
+        &self,
+        challenge_id: &str,
+        responses: Option<Vec<String>>,
+    ) -> bool {
+        if let Some((_, tx)) = self.pending_kbi_challenges.remove(challenge_id) {
+            let _ = tx.send(responses);
+            true
+        } else {
+            false
+        }
+    }
+
+    async fn connect_tcp_with_keepalive(addr: &str) -> SshResult<tokio::net::TcpStream> {
+        let stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .map_err(|e| SshError::Connect(format!("{addr}: {e}")))?;
+        if let Err(e) = stream.set_nodelay(true) {
+            debug!("TCP set_nodelay failed for {addr}: {e}");
+        }
+        let sock_ref = SockRef::from(&stream);
+        let tcp_keepalive = TcpKeepalive::new()
+            .with_time(Duration::from_secs(60))
+            .with_interval(Duration::from_secs(15));
+        if let Err(e) = sock_ref.set_tcp_keepalive(&tcp_keepalive) {
+            debug!("TCP set_tcp_keepalive failed for {addr}: {e}");
+        }
+        Ok(stream)
+    }
+
+    async fn connect_single(
+        target: &SshTarget,
+        verifier: Arc<dyn HostKeyVerifier>,
+        tunnel: Option<&Handle<StermClientHandler>>,
+    ) -> SshResult<(Handle<StermClientHandler>, Arc<Mutex<Option<String>>>)> {
+        let mut config = client::Config {
+            nodelay: true,
+            inactivity_timeout: None,
+            ..Default::default()
+        };
+        if target.keepalive_secs > 0 {
+            config.keepalive_interval = Some(Duration::from_secs(target.keepalive_secs as u64));
+            // Keep sending SSH keepalives to prevent NAT/firewall/sshd idle timeouts,
+            // while setting keepalive_max = 0 so temporary network stalls or OS sleep/wake
+            // cycles don't prematurely terminate the session (matching OpenSSH's default).
+            // OS TCP keepalive + TCP retransmission still detect genuinely dead peers.
+            config.keepalive_max = 0;
+        }
+        let config = Arc::new(config);
+        let disconnect_reason = Arc::new(Mutex::new(None));
+        let handler = StermClientHandler {
+            hostname: target.hostname.clone(),
+            port: target.port,
+            verifier: Arc::clone(&verifier),
+            disconnect_reason: Arc::clone(&disconnect_reason),
+        };
+
+        let mut handle = match tunnel {
+            None => {
+                let addr = format!("{}:{}", target.hostname, target.port);
+                let stream = Self::connect_tcp_with_keepalive(&addr).await?;
+                client::connect_stream(config, stream, handler)
+                    .await
+                    .map_err(|e| SshError::Connect(format!("{}: {}", addr, e)))?
+            }
+            Some(parent_handle) => {
+                let channel = parent_handle
+                    .channel_open_direct_tcpip(
+                        target.hostname.clone(),
+                        target.port as u32,
+                        "127.0.0.1",
+                        0,
+                    )
+                    .await
+                    .map_err(|e| SshError::ProxyJump(e.to_string()))?;
+                client::connect_stream(config, channel.into_stream(), handler)
+                    .await
+                    .map_err(|e| SshError::Connect(e.to_string()))?
+            }
+        };
+
+        Self::authenticate(&mut handle, target, verifier.as_ref()).await?;
+        Ok((handle, disconnect_reason))
+    }
+
+    async fn try_agent_identities<S>(
+        handle: &mut Handle<StermClientHandler>,
+        target: &SshTarget,
+        agent: &mut AgentClient<S>,
+    ) -> SshResult<bool>
+    where
+        S: AgentStream + Unpin + Send + 'static,
+    {
+        let identities = agent
+            .request_identities()
+            .await
+            .map_err(|e| SshError::Auth(format!("SSH agent request_identities failed: {e}")))?;
+
+        if identities.is_empty() {
+            return Ok(false);
+        }
+
+        for identity in identities {
+            let auth_res = match identity {
+                AgentIdentity::PublicKey { key, .. } => {
+                    let hash_alg = if key.algorithm().is_rsa() {
+                        Some(HashAlg::Sha256)
+                    } else {
+                        None
+                    };
+                    handle
+                        .authenticate_publickey_with(target.username.clone(), key, hash_alg, agent)
+                        .await
+                }
+                AgentIdentity::Certificate { certificate, .. } => {
+                    let hash_alg = if certificate.algorithm().is_rsa() {
+                        Some(HashAlg::Sha256)
+                    } else {
+                        None
+                    };
+                    handle
+                        .authenticate_certificate_with(
+                            target.username.clone(),
+                            certificate,
+                            hash_alg,
+                            agent,
+                        )
+                        .await
+                }
+            };
+            match auth_res {
+                Ok(res) if res.success() => return Ok(true),
+                Ok(_) => continue,
+                Err(e) => {
+                    debug!("SSH agent identity attempt failed: {e}");
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    async fn authenticate_with_agent(
+        handle: &mut Handle<StermClientHandler>,
+        target: &SshTarget,
+    ) -> SshResult<bool> {
+        #[cfg(unix)]
+        {
+            let mut agent = AgentClient::connect_env().await.map_err(|e| {
+                SshError::Auth(format!(
+                    "could not connect to local SSH agent (check SSH_AUTH_SOCK): {e}"
+                ))
+            })?;
+            let ok = Self::try_agent_identities(handle, target, &mut agent).await?;
+            if !ok {
+                return Err(SshError::Auth(format!(
+                    "no SSH agent identity accepted for {}@{}:{} (verify keys are loaded with `ssh-add -l`)",
+                    target.username, target.hostname, target.port
+                )));
+            }
+            Ok(true)
+        }
+
+        #[cfg(windows)]
+        {
+            let mut errors: Vec<String> = Vec::new();
+            let mut connected_any = false;
+
+            // 1. Windows OpenSSH Authentication Agent named pipe
+            match AgentClient::connect_named_pipe(r"\\.\pipe\openssh-ssh-agent").await {
+                Ok(mut agent) => {
+                    connected_any = true;
+                    match Self::try_agent_identities(handle, target, &mut agent).await {
+                        Ok(true) => return Ok(true),
+                        Ok(false) => {}
+                        Err(e) => errors.push(format!("OpenSSH agent: {e}")),
+                    }
+                }
+                Err(e) => errors.push(format!("OpenSSH agent pipe unavailable: {e}")),
+            }
+
+            // 2. Fallback to Pageant (PuTTY / KeePassXC / GPG4Win)
+            match AgentClient::connect_pageant().await {
+                Ok(mut pageant) => {
+                    connected_any = true;
+                    match Self::try_agent_identities(handle, target, &mut pageant).await {
+                        Ok(true) => return Ok(true),
+                        Ok(false) => {}
+                        Err(e) => errors.push(format!("Pageant: {e}")),
+                    }
+                }
+                Err(e) => errors.push(format!("Pageant unavailable: {e}")),
+            }
+
+            if connected_any {
+                Err(SshError::Auth(format!(
+                    "no SSH agent identity accepted for {}@{}:{} (verify keys are loaded with `ssh-add -l`)",
+                    target.username, target.hostname, target.port
+                )))
+            } else {
+                Err(SshError::Auth(format!(
+                    "could not connect to Windows SSH agent ({})",
+                    errors.join("; ")
+                )))
+            }
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (handle, target);
+            Err(SshError::Auth(
+                "SSH agent authentication is not supported on this platform".into(),
+            ))
+        }
+    }
+
+    async fn authenticate_keyboard_interactive(
+        handle: &mut Handle<StermClientHandler>,
+        target: &SshTarget,
+        verifier: &dyn HostKeyVerifier,
+        mut prefill_password: Option<&str>,
+    ) -> SshResult<bool> {
+        let mut response = handle
+            .authenticate_keyboard_interactive_start(target.username.clone(), None)
+            .await
+            .map_err(|e| SshError::Auth(e.to_string()))?;
+
+        const MAX_KBI_ROUNDS: usize = 16;
+        for _ in 0..MAX_KBI_ROUNDS {
+            match response {
+                KeyboardInteractiveAuthResponse::Success => return Ok(true),
+                KeyboardInteractiveAuthResponse::Failure { .. } => return Ok(false),
+                KeyboardInteractiveAuthResponse::InfoRequest {
+                    name,
+                    instructions,
+                    prompts,
+                } => {
+                    let answers = if prompts.is_empty() {
+                        Vec::new()
+                    } else if prompts.len() == 1
+                        && !prompts[0].echo
+                        && prefill_password.is_some()
+                    {
+                        // Auto-supply password once for PAM/keyboard-interactive password prompts.
+                        let pw = prefill_password.take().unwrap_or_default();
+                        vec![pw.to_string()]
+                    } else {
+                        let challenge = KeyboardInteractiveChallenge {
+                            challenge_id: Uuid::now_v7().to_string(),
+                            hostname: target.hostname.clone(),
+                            port: target.port,
+                            username: target.username.clone(),
+                            name,
+                            instructions,
+                            prompts: prompts
+                                .into_iter()
+                                .map(|p| KeyboardInteractivePrompt {
+                                    prompt: p.prompt,
+                                    echo: p.echo,
+                                })
+                                .collect(),
+                        };
+                        match verifier.prompt_keyboard_interactive(challenge).await {
+                            Some(ans) => ans,
+                            None => {
+                                return Err(SshError::Auth(
+                                    "keyboard-interactive authentication cancelled".into(),
+                                ))
+                            }
+                        }
+                    };
+
+                    response = handle
+                        .authenticate_keyboard_interactive_respond(answers)
+                        .await
+                        .map_err(|e| SshError::Auth(e.to_string()))?;
+                }
+            }
+        }
+
+        Err(SshError::Auth(
+            "too many keyboard-interactive authentication rounds".into(),
+        ))
+    }
+
+    async fn authenticate(
+        handle: &mut Handle<StermClientHandler>,
+        target: &SshTarget,
+        verifier: &dyn HostKeyVerifier,
+    ) -> SshResult<()> {
+        let ok = match &target.auth {
+            SshAuthMethod::Password { password } => {
+                let pw_res = handle
+                    .authenticate_password(target.username.clone(), password.clone())
+                    .await
+                    .map_err(|e| SshError::Auth(e.to_string()))?;
+                if pw_res.success() {
+                    true
+                } else {
+                    // Some servers disable `password` auth and require PAM `keyboard-interactive`.
+                    Self::authenticate_keyboard_interactive(
+                        handle,
+                        target,
+                        verifier,
+                        Some(password.as_str()),
+                    )
+                    .await
+                    .unwrap_or(false)
+                }
+            }
+            SshAuthMethod::PrivateKey { pem, passphrase } => {
+                let key = decode_secret_key(pem, passphrase.as_deref())
+                    .map_err(|e| SshError::InvalidKey(e.to_string()))?;
+                let hash_alg = if key.algorithm().is_rsa() {
+                    Some(HashAlg::Sha256)
+                } else {
+                    None
+                };
+                let key_with_alg = PrivateKeyWithHashAlg::new(Arc::new(key), hash_alg);
+                handle
+                    .authenticate_publickey(target.username.clone(), key_with_alg)
+                    .await
+                    .map_err(|e| SshError::Auth(e.to_string()))?
+                    .success()
+            }
+            SshAuthMethod::Certificate {
+                pem,
+                passphrase,
+                certificate,
+            } => {
+                let key = decode_secret_key(pem, passphrase.as_deref())
+                    .map_err(|e| SshError::InvalidKey(e.to_string()))?;
+                let cert = Certificate::from_openssh(certificate.trim())
+                    .map_err(|e| SshError::InvalidKey(format!("invalid OpenSSH certificate: {e}")))?;
+                handle
+                    .authenticate_openssh_cert(target.username.clone(), Arc::new(key), cert)
+                    .await
+                    .map_err(|e| SshError::Auth(e.to_string()))?
+                    .success()
+            }
+            SshAuthMethod::SshAgent => Self::authenticate_with_agent(handle, target).await?,
+            SshAuthMethod::KeyboardInteractive => {
+                Self::authenticate_keyboard_interactive(handle, target, verifier, None).await?
+            }
+            SshAuthMethod::None => handle
+                .authenticate_none(target.username.clone())
+                .await
+                .map_err(|e| SshError::Auth(e.to_string()))?
+                .success(),
+        };
+
+        if !ok {
+            return Err(SshError::Auth(format!(
+                "authentication rejected for {}@{}:{}",
+                target.username, target.hostname, target.port
+            )));
+        }
+        Ok(())
+    }
+
+    /// Establishes an SSH session (optionally traversing one or more ProxyJump hops)
+    /// and optionally opens an interactive PTY shell streaming events to `on_event`.
+    pub async fn connect_shell<F>(
+        &self,
+        req: ConnectRequest,
+        verifier: Arc<dyn HostKeyVerifier>,
+        mut on_event: F,
+    ) -> SshResult<String>
+    where
+        F: FnMut(TerminalEvent) + Send + 'static,
+    {
+        let (target_handle, jump_handles, disconnect_reason) =
+            self.connect_chain(&req, verifier).await?;
+        let target_handle = Arc::new(target_handle);
+
+        let mut channel = target_handle
+            .channel_open_session()
+            .await
+            .map_err(|e| SshError::Channel(e.to_string()))?;
+
+        channel
+            .request_pty(false, "xterm-256color", req.cols, req.rows, 0, 0, &[])
+            .await
+            .map_err(|e| SshError::Channel(e.to_string()))?;
+
+        channel
+            .request_shell(false)
+            .await
+            .map_err(|e| SshError::Channel(e.to_string()))?;
+
+        if let Some(cmd) = req.startup_command {
+            let trimmed = cmd.trim();
+            if !trimmed.is_empty() {
+                let mut bytes = trimmed.as_bytes().to_vec();
+                bytes.push(b'\n');
+                let _ = channel.data(bytes.as_slice()).await;
+            }
+        }
+
+        let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<ShellControl>(256);
+        let session_id = Uuid::now_v7().to_string();
+
+        self.sessions.insert(
+            session_id.clone(),
+            ActiveSession {
+                handle: Arc::clone(&target_handle),
+                _jump_handles: jump_handles,
+                shell_tx: Some(ctrl_tx),
+            },
+        );
+
+        let sid_log = session_id.clone();
+        let sessions = Arc::clone(&self.sessions);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    Some(ctrl) = ctrl_rx.recv() => {
+                        match ctrl {
+                            ShellControl::Input(bytes) => {
+                                if let Err(e) = channel.data(bytes.as_slice()).await {
+                                    on_event(TerminalEvent::Error { message: e.to_string() });
+                                    break;
+                                }
+                            }
+                            ShellControl::Resize { cols, rows } => {
+                                if let Err(e) = channel.window_change(cols, rows, 0, 0).await {
+                                    warn!("resize_pty failed for {sid_log}: {e}");
+                                }
+                            }
+                            ShellControl::Close => {
+                                let _ = channel.eof().await;
+                                let _ = channel.close().await;
+                                on_event(TerminalEvent::Closed { reason: "closed by user".into() });
+                                break;
+                            }
+                        }
+                    }
+                    msg = channel.wait() => {
+                        match msg {
+                            Some(ChannelMsg::Data { data }) => {
+                                on_event(TerminalEvent::Output { data: data.to_vec() });
+                            }
+                            Some(ChannelMsg::ExtendedData { data, .. }) => {
+                                on_event(TerminalEvent::Output { data: data.to_vec() });
+                            }
+                            Some(ChannelMsg::ExitStatus { exit_status }) => {
+                                debug!("session {sid_log} exited with code {exit_status}");
+                            }
+                            Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
+                                // Yield once so StermClientHandler::disconnected can record any transport error.
+                                tokio::task::yield_now().await;
+                                let reason = disconnect_reason
+                                    .lock()
+                                    .ok()
+                                    .and_then(|g| g.clone())
+                                    .unwrap_or_else(|| "remote closed session".into());
+                                on_event(TerminalEvent::Closed { reason });
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            sessions.remove(&sid_log);
+        });
+
+        Ok(session_id)
+    }
+
+    /// Connects a transport-only SSH session (e.g., for direct SFTP without spawning a PTY).
+    pub async fn connect_transport_only(
+        &self,
+        req: ConnectRequest,
+        verifier: Arc<dyn HostKeyVerifier>,
+    ) -> SshResult<String> {
+        let (target_handle, jump_handles, _disconnect_reason) =
+            self.connect_chain(&req, verifier).await?;
+        let session_id = Uuid::now_v7().to_string();
+        self.sessions.insert(
+            session_id.clone(),
+            ActiveSession {
+                handle: Arc::new(target_handle),
+                _jump_handles: jump_handles,
+                shell_tx: None,
+            },
+        );
+        Ok(session_id)
+    }
+
+    async fn connect_chain(
+        &self,
+        req: &ConnectRequest,
+        verifier: Arc<dyn HostKeyVerifier>,
+    ) -> SshResult<(
+        Handle<StermClientHandler>,
+        Vec<Handle<StermClientHandler>>,
+        Arc<Mutex<Option<String>>>,
+    )> {
+        let mut jump_handles: Vec<Handle<StermClientHandler>> = Vec::new();
+
+        for hop in &req.jump_chain {
+            let (h, _) =
+                Self::connect_single(hop, Arc::clone(&verifier), jump_handles.last()).await?;
+            jump_handles.push(h);
+        }
+
+        let (target_handle, disconnect_reason) =
+            Self::connect_single(&req.target, verifier, jump_handles.last()).await?;
+        Ok((target_handle, jump_handles, disconnect_reason))
+    }
+
+    /// Initiates an SSH transport key re-exchange on an active session.
+    pub async fn rekey_session(&self, session_id: &str) -> SshResult<()> {
+        let handle = {
+            let entry = self
+                .sessions
+                .get(session_id)
+                .ok_or_else(|| SshError::SessionNotFound(session_id.to_string()))?;
+            Arc::clone(&entry.handle)
+        };
+        handle
+            .rekey_soon()
+            .await
+            .map_err(|e| SshError::Channel(format!("rekey failed: {e}")))
+    }
+
+    pub async fn write_input(&self, session_id: &str, data: Vec<u8>) -> SshResult<()> {
+        let tx = {
+            let entry = self
+                .sessions
+                .get(session_id)
+                .ok_or_else(|| SshError::SessionNotFound(session_id.to_string()))?;
+            entry
+                .shell_tx
+                .clone()
+                .ok_or_else(|| SshError::Channel("session has no interactive PTY".into()))?
+        };
+        tx.send(ShellControl::Input(data))
+            .await
+            .map_err(|_| SshError::Channel("shell stream closed".into()))
+    }
+
+    pub async fn resize(&self, session_id: &str, cols: u32, rows: u32) -> SshResult<()> {
+        let tx = {
+            let entry = self
+                .sessions
+                .get(session_id)
+                .ok_or_else(|| SshError::SessionNotFound(session_id.to_string()))?;
+            entry
+                .shell_tx
+                .clone()
+                .ok_or_else(|| SshError::Channel("session has no interactive PTY".into()))?
+        };
+        tx.send(ShellControl::Resize { cols, rows })
+            .await
+            .map_err(|_| SshError::Channel("shell stream closed".into()))
+    }
+
+    /// Opens a multiplexed SFTP subsystem stream over an active SSH session.
+    pub async fn open_sftp_stream(
+        &self,
+        session_id: &str,
+    ) -> SshResult<ChannelStream<russh::client::Msg>> {
+        let handle = {
+            let entry = self
+                .sessions
+                .get(session_id)
+                .ok_or_else(|| SshError::SessionNotFound(session_id.to_string()))?;
+            Arc::clone(&entry.handle)
+        };
+
+        let channel = handle
+            .channel_open_session()
+            .await
+            .map_err(|e| SshError::Channel(e.to_string()))?;
+
+        channel
+            .request_subsystem(true, "sftp")
+            .await
+            .map_err(|e| SshError::Channel(format!("failed to request sftp subsystem: {e}")))?;
+
+        Ok(channel.into_stream())
+    }
+
+    pub async fn close_session(&self, session_id: &str) -> SshResult<()> {
+        if let Some((_, session)) = self.sessions.remove(session_id) {
+            if let Some(tx) = session.shell_tx {
+                let _ = tx.send(ShellControl::Close).await;
+            }
+            let _ = session
+                .handle
+                .disconnect(russh::Disconnect::ByApplication, "closed", "en")
+                .await;
+        }
+        Ok(())
+    }
+
+    pub fn active_session_ids(&self) -> Vec<String> {
+        self.sessions.iter().map(|e| e.key().clone()).collect()
+    }
+}

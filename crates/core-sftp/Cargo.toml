@@ -1,0 +1,16 @@
+[package]
+name = "core-sftp"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+core-ssh = { path = "../core-ssh" }
+dashmap.workspace = true
+dirs.workspace = true
+russh-sftp.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+uuid.workspace = true

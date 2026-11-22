@@ -1,0 +1,10 @@
+target/
+dist-release/
+*.db
+*.db-shm
+*.db-wal
+*.sterm-vault
+.DS_Store
+Thumbs.db
+.env
+.env.local

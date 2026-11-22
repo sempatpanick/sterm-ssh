@@ -1,0 +1,7 @@
+target
+dist-release
+.git
+*.db
+*.db-wal
+*.db-shm
+*.sterm-vault

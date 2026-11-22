@@ -1,0 +1,11 @@
+#!/usr/bin/env sh
+# Local git commit-msg hook: blocks commits containing AI/agent co-author trailers.
+# Enable locally with: git config core.hooksPath .githooks
+set -eu
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+CHECKER="$REPO_ROOT/.github/scripts/check-no-agent-coauthor.sh"
+
+if [ -f "$CHECKER" ]; then
+  sh "$CHECKER" --file "commit message" "$1"
+fi

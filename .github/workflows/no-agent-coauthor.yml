@@ -1,0 +1,80 @@
+name: No Agent Co-Author Policy
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+jobs:
+  check-no-agent-coauthor:
+    name: Enforce No Agent Co-Author on Commits & PRs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check commits for prohibited agent co-author attribution
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          CHECKER=".github/scripts/check-no-agent-coauthor.sh"
+          chmod +x "$CHECKER"
+
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            COMMITS=$(git rev-list "${PR_BASE_SHA}..${PR_HEAD_SHA}")
+          elif [ -n "$PUSH_BEFORE" ] && [ "$PUSH_BEFORE" != "0000000000000000000000000000000000000000" ] && git cat-file -e "${PUSH_BEFORE}^{commit}" 2>/dev/null; then
+            COMMITS=$(git rev-list "${PUSH_BEFORE}..${PUSH_AFTER}")
+          else
+            COMMITS=$(git rev-list "${PUSH_AFTER}")
+          fi
+
+          STATUS=0
+          TMP_MSG="$(mktemp)"
+          trap 'rm -f "$TMP_MSG"' EXIT
+
+          for sha in $COMMITS; do
+            git show -s --format=%B "$sha" > "$TMP_MSG"
+            if ! sh "$CHECKER" --file "commit $sha" "$TMP_MSG"; then
+              STATUS=1
+            fi
+            AUTHOR="$(git show -s --format='%an <%ae>' "$sha")"
+            COMMITTER="$(git show -s --format='%cn <%ce>' "$sha")"
+            if ! sh "$CHECKER" --identity "commit $sha author" "$AUTHOR"; then
+              STATUS=1
+            fi
+            if ! sh "$CHECKER" --identity "commit $sha committer" "$COMMITTER"; then
+              STATUS=1
+            fi
+          done
+
+          if [ "$STATUS" -ne 0 ]; then
+            echo ""
+            echo "Policy violation: Commits must not include any AI or coding agent as author or co-author."
+            echo "Please amend/rebase your commits to remove agent trailers (e.g. Co-authored-by:) and force-push."
+            exit 1
+          fi
+
+      - name: Check Pull Request title & description
+        if: github.event_name == 'pull_request'
+        shell: bash
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          TMP_PR="$(mktemp)"
+          trap 'rm -f "$TMP_PR"' EXIT
+          printf '%s\n\n%s\n' "$PR_TITLE" "$PR_BODY" > "$TMP_PR"
+          if ! sh .github/scripts/check-no-agent-coauthor.sh --file "pull request description" "$TMP_PR"; then
+            echo ""
+            echo "Policy violation: Pull request descriptions must not include AI/agent co-author or attribution footers."
+            exit 1
+          fi

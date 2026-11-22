@@ -1,0 +1,12 @@
+---
+description: Prohibit AI or coding agent co-author attribution in all commits and PRs
+globs: "**/*"
+alwaysApply: true
+---
+
+# No Agent Co-Author Policy (Mandatory)
+
+- **NEVER** add any `Co-authored-by:` / `Co-Authored-By:`, `Assisted-by:`, or `Generated-by:` trailer referencing Cursor or any other AI/coding agent to git commits or pull requests.
+- **NEVER** append AI-generated attribution footers to commit messages or PR bodies.
+- Always keep the commit author and committer as the human contributor's Git identity.
+- Enforced by `.githooks/commit-msg` and `.github/workflows/no-agent-coauthor.yml`.
