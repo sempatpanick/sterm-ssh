@@ -3,6 +3,7 @@ use core_vault::models::{CredentialKind, HostAuthMode, PortForwardKind};
 use gpui::{div, prelude::*, px, rgb, AnyElement, Context, Entity, FontWeight, MouseButton};
 
 use crate::app::{ActiveModal, ConfirmAction, StermAdminApp};
+use crate::keybindings::ShortcutAction;
 use crate::local_shell::LocalShellManager;
 use crate::motion::animate_modal_enter;
 use crate::text_field::TextField;
@@ -102,6 +103,7 @@ impl StermAdminApp {
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| {
                     if can_backdrop_dismiss {
+                        this.recording_shortcut = None;
                         this.modal = None;
                         cx.notify();
                     }
@@ -3306,23 +3308,18 @@ impl StermAdminApp {
         t: &ThemePalette,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let rows: [(&str, &str); 12] = [
-            ("Ctrl / Cmd + K", "Open Command Omnibar & Quick Connect"),
-            ("Ctrl / Cmd + 1", "Switch to Vault Home tab"),
-            ("Ctrl / Cmd + 2..9", "Jump directly to open workspace tab #1..#8"),
-            ("Ctrl / Cmd + D", "Split active terminal horizontally (side-by-side)"),
-            ("Ctrl / Cmd + Shift + D", "Split active terminal vertically (top/bottom)"),
-            ("Ctrl / Cmd + F", "Toggle scrollback search in active terminal"),
-            ("Ctrl / Cmd + Space", "Toggle inline command suggestions & snippets"),
-            ("Ctrl / Cmd + W", "Close current workspace tab"),
-            ("Ctrl / Cmd + Shift + L", "Lock encrypted vault immediately"),
+        let fixed_rows: [(&str, &str); 3] = [
+            (
+                "Ctrl / Cmd + 1..9",
+                "Switch to Vault Home tab (#1) or open workspace tabs (#2..#9)",
+            ),
             ("Ctrl / Cmd + C / V", "Copy selection / paste in terminal"),
             ("Shift + PgUp / PgDn", "Scroll terminal scrollback buffer"),
-            ("Ctrl / Cmd + /", "Open this Keyboard Shortcuts Cheat Sheet"),
         ];
 
         div()
-            .w(px(560.0))
+            .w(px(610.0))
+            .max_h(px(620.0))
             .rounded_2xl()
             .bg(t.bg_card)
             .border_1()
@@ -3331,54 +3328,184 @@ impl StermAdminApp {
             .p_5()
             .flex()
             .flex_col()
-            .gap_3p5()
+            .gap_3()
             .child(self.modal_header(
                 t,
-                "Keyboard Shortcuts",
-                "Power-user navigation across Vault, Terminal panes, and SFTP.",
+                "Keyboard Shortcuts & Keybindings",
+                "Click any customizable shortcut pill to record a new key combination (Esc cancels recording).",
                 cx,
             ))
             .child(
                 div()
+                    .id("shortcuts-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
                     .flex()
                     .flex_col()
-                    .gap_1p5()
-                    .children(rows.into_iter().map(|(keys, desc)| {
+                    .gap_2()
+                    .child(
                         div()
-                            .px_3()
-                            .py_1p5()
-                            .rounded_lg()
-                            .bg(t.bg_subtle)
                             .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap_3()
-                            .child(
+                            .flex_col()
+                            .gap_1p5()
+                            .children(ShortcutAction::ALL.into_iter().enumerate().map(
+                                |(ix, action)| {
+                                    let is_recording = self.recording_shortcut == Some(action);
+                                    let key_text = if is_recording {
+                                        "Press keys... (Esc)".to_string()
+                                    } else {
+                                        self.settings.keybindings.display(action)
+                                    };
+                                    div()
+                                        .px_3()
+                                        .py_1p5()
+                                        .rounded_lg()
+                                        .bg(t.bg_subtle)
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .gap_3()
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_col()
+                                                .min_w_0()
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .font_weight(FontWeight::MEDIUM)
+                                                        .text_color(t.text_primary)
+                                                        .child(action.label()),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_size(px(10.0))
+                                                        .text_color(t.text_muted)
+                                                        .child(action.description()),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .id(("sc-bind-btn", ix))
+                                                .px_2p5()
+                                                .py_1()
+                                                .rounded_md()
+                                                .border_1()
+                                                .cursor_pointer()
+                                                .bg(if is_recording {
+                                                    t.accent_soft
+                                                } else {
+                                                    t.bg_card
+                                                })
+                                                .border_color(if is_recording {
+                                                    t.accent
+                                                } else {
+                                                    t.border_strong
+                                                })
+                                                .hover(|s| s.border_color(t.accent))
+                                                .font_family("Consolas")
+                                                .text_size(px(11.0))
+                                                .text_color(if is_recording {
+                                                    t.accent
+                                                } else {
+                                                    t.text_primary
+                                                })
+                                                .whitespace_nowrap()
+                                                .tooltip(StermTooltip::text(
+                                                    if is_recording {
+                                                        "Press desired key combo or Esc to cancel"
+                                                    } else {
+                                                        "Click to rebind shortcut"
+                                                    },
+                                                    *t,
+                                                ))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.recording_shortcut =
+                                                        if this.recording_shortcut == Some(action) {
+                                                            None
+                                                        } else {
+                                                            Some(action)
+                                                        };
+                                                    cx.notify();
+                                                }))
+                                                .child(key_text),
+                                        )
+                                },
+                            )),
+                    )
+                    .child(
+                        div()
+                            .pt_1p5()
+                            .text_size(px(10.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(t.text_muted)
+                            .child("FIXED NAVIGATION"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .children(fixed_rows.into_iter().map(|(keys, desc)| {
                                 div()
-                                    .text_xs()
-                                    .text_color(t.text_primary)
-                                    .child(desc),
-                            )
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_0p5()
-                                    .rounded_md()
-                                    .bg(t.bg_card)
-                                    .border_1()
-                                    .border_color(t.border_strong)
-                                    .font_family("Consolas")
-                                    .text_size(px(11.0))
-                                    .text_color(t.accent)
-                                    .whitespace_nowrap()
-                                    .child(keys),
-                            )
-                    })),
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_lg()
+                                    .bg(t.bg_subtle)
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_3()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(t.text_secondary)
+                                            .child(desc),
+                                    )
+                                    .child(
+                                        div()
+                                            .px_2()
+                                            .py_0p5()
+                                            .rounded_md()
+                                            .bg(t.bg_card)
+                                            .border_1()
+                                            .border_color(t.border)
+                                            .font_family("Consolas")
+                                            .text_size(px(11.0))
+                                            .text_color(t.text_muted)
+                                            .whitespace_nowrap()
+                                            .child(keys),
+                                    )
+                            })),
+                    ),
             )
             .child(
                 div()
                     .flex()
-                    .justify_end()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("sc-reset-defaults")
+                            .px_3()
+                            .py_1p5()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(t.border_strong)
+                            .text_xs()
+                            .text_color(t.text_secondary)
+                            .cursor_pointer()
+                            .hover(|s| s.bg(t.bg_subtle).text_color(t.text_primary))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.settings.keybindings.reset_defaults();
+                                this.recording_shortcut = None;
+                                this.save_settings(cx);
+                                this.set_toast("Restored default keyboard shortcuts.", false);
+                            }))
+                            .child("Reset Defaults"),
+                    )
                     .child(self.cancel_modal_btn(t, cx)),
             )
     }
@@ -3429,6 +3556,7 @@ impl StermAdminApp {
                     .hover(|s| s.bg(t.bg_subtle).text_color(t.text_primary))
                     .tooltip(StermTooltip::with_shortcut("Close", "Esc", *t))
                     .on_click(cx.listener(|this, _, _, cx| {
+                        this.recording_shortcut = None;
                         this.modal = None;
                         cx.notify();
                     }))
@@ -3449,6 +3577,7 @@ impl StermAdminApp {
             .cursor_pointer()
             .hover(|s| s.bg(t.bg_subtle).text_color(t.text_primary))
             .on_click(cx.listener(|this, _, _, cx| {
+                this.recording_shortcut = None;
                 this.modal = None;
                 cx.notify();
             }))

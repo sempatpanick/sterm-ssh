@@ -152,17 +152,57 @@ struct Osc8LinkEntry {
     anchor_char: Option<(usize, u16, char)>,
 }
 
-/// Tracks OSC 8 terminal hyperlinks (`\x1b]8;;https://...\x07Click here\x1b]8;;\x07`).
+/// Tracks OSC 8 terminal hyperlinks and OSC 7 current working directory notifications.
 #[derive(Debug, Default)]
 pub struct Osc8Tracker {
     active: Option<(bool, usize, u16, String)>,
     links: Vec<Osc8LinkEntry>,
     discarded_rows: usize,
+    current_cwd: Option<String>,
+}
+
+/// Parses an OSC 7 `file://host/path` URI into a local/remote directory path string.
+pub fn parse_osc7_cwd(uri: &str) -> Option<String> {
+    let rest = uri.trim().strip_prefix("file://")?;
+    let slash_idx = rest.find('/')?;
+    let raw_path = &rest[slash_idx..];
+
+    let mut bytes = Vec::with_capacity(raw_path.len());
+    let raw_bytes = raw_path.as_bytes();
+    let mut i = 0;
+    while i < raw_bytes.len() {
+        if raw_bytes[i] == b'%'
+            && i + 2 < raw_bytes.len()
+            && let Ok(hex) = std::str::from_utf8(&raw_bytes[i + 1..i + 3])
+            && let Ok(val) = u8::from_str_radix(hex, 16)
+        {
+            bytes.push(val);
+            i += 3;
+            continue;
+        }
+        bytes.push(raw_bytes[i]);
+        i += 1;
+    }
+
+    let mut decoded = String::from_utf8_lossy(&bytes).to_string();
+    // Normalize Windows drive URI `/C:/Users/me` -> `C:/Users/me`
+    let b = decoded.as_bytes();
+    if b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b':' {
+        decoded.remove(0);
+    }
+    if decoded.len() > 1 && decoded.ends_with('/') {
+        decoded.pop();
+    }
+    (!decoded.is_empty()).then_some(decoded)
 }
 
 impl Osc8Tracker {
     pub fn discarded_rows(&self) -> usize {
         self.discarded_rows
+    }
+
+    pub fn current_cwd(&self) -> Option<&str> {
+        self.current_cwd.as_deref()
     }
 
     fn abs_row(&self, screen: &vt100::Screen, row: u16) -> usize {
@@ -244,6 +284,17 @@ impl Osc8Tracker {
 
 impl vt100::Callbacks for Osc8Tracker {
     fn unhandled_osc(&mut self, screen: &mut vt100::Screen, params: &[&[u8]]) {
+        if params.first().copied() == Some(b"7") && params.len() >= 2 {
+            let raw = params[1..]
+                .iter()
+                .map(|p| String::from_utf8_lossy(p))
+                .collect::<Vec<_>>()
+                .join(";");
+            if let Some(cwd) = parse_osc7_cwd(&raw) {
+                self.current_cwd = Some(cwd);
+            }
+            return;
+        }
         if params.first().copied() != Some(b"8") || params.len() < 3 {
             return;
         }
@@ -517,16 +568,25 @@ impl TerminalTab {
         self.transcript_path = None;
     }
 
+    pub fn current_cwd(&self) -> Option<&str> {
+        self.parser.callbacks().current_cwd()
+    }
+
     pub fn is_alternate_screen(&self) -> bool {
         self.parser.screen().alternate_screen()
     }
 
     pub fn clear_buffer(&mut self) {
+        let prev_cwd = self.current_cwd().map(|s| s.to_string());
+        let tracker = Osc8Tracker {
+            current_cwd: prev_cwd,
+            ..Default::default()
+        };
         self.parser = vt100::Parser::new_with_callbacks(
             NonZeroU16::new(self.rows.max(4)).unwrap(),
             NonZeroU16::new(self.cols.max(20)).unwrap(),
             TERM_SCROLLBACK_LEN,
-            Osc8Tracker::default(),
+            tracker,
         );
         self.clear_selection();
         self.hovered_url = None;
@@ -2753,5 +2813,24 @@ mod tests {
         let raw = b"\x1b[32mhello\x1b[0m \x1b]0;window title\x07world\r\n\x1b[1;31merr\x1b[0m\n";
         let clean = strip_ansi_for_log(raw);
         assert_eq!(clean, "hello world\nerr\n");
+    }
+
+    #[test]
+    fn tracks_osc7_current_working_directory_with_percent_decoding() {
+        let mut tab = TerminalTab::connecting(
+            "t-osc7".into(),
+            None,
+            "srv".into(),
+            "127.0.0.1".into(),
+            22,
+            "root".into(),
+        );
+        assert_eq!(tab.current_cwd(), None);
+
+        tab.feed_bytes(b"\x1b]7;file://prod-01/var/www/my%20app/\x07");
+        assert_eq!(tab.current_cwd(), Some("/var/www/my app"));
+
+        tab.feed_bytes(b"\x1b]7;file:///C:/Users/dev/project\x1b\\");
+        assert_eq!(tab.current_cwd(), Some("C:/Users/dev/project"));
     }
 }

@@ -71,6 +71,7 @@ pub enum UiEvent {
         host_label: String,
         remote_cwd: String,
         local_cwd: String,
+        sftp_tab_id: Option<String>,
     },
     SftpLocalListed {
         path: String,
@@ -152,6 +153,107 @@ pub enum UiEvent {
         entries: Vec<FileEntry>,
     },
     BiometricUnlockResult(Result<bool, String>),
+    SystemSleepDetected {
+        slept_secs: u64,
+    },
+}
+
+/// Detects whether the OS likely slept/hibernated by comparing wall-clock elapsed time
+/// against unbiased awake monotonic duration (excluding OS suspend time).
+pub fn detect_system_sleep_gap(
+    wall_elapsed: std::time::Duration,
+    awake_elapsed: std::time::Duration,
+    threshold: std::time::Duration,
+) -> Option<u64> {
+    let gap = wall_elapsed.saturating_sub(awake_elapsed);
+    if gap >= threshold {
+        Some(gap.as_secs())
+    } else {
+        None
+    }
+}
+
+#[cfg(windows)]
+pub fn awake_monotonic_duration() -> std::time::Duration {
+    unsafe extern "system" {
+        fn QueryUnbiasedInterruptTime(unbiased_time: *mut u64) -> i32;
+    }
+    let mut ticks: u64 = 0;
+    // SAFETY: `ticks` is an aligned stack u64 pointer and Win32 populates 100ns units.
+    let ok = unsafe { QueryUnbiasedInterruptTime(&mut ticks) };
+    if ok != 0 {
+        std::time::Duration::from_micros(ticks / 10)
+    } else {
+        std::time::Duration::ZERO
+    }
+}
+
+#[cfg(not(windows))]
+pub fn awake_monotonic_duration() -> std::time::Duration {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed()
+}
+
+/// Builds a shell-safe `cd` startup command for opening a remote SSH terminal at `dir`.
+pub fn build_remote_cd_command(dir: &str) -> Option<String> {
+    let trimmed = dir.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let escaped = trimmed.replace('\'', "'\"'\"'");
+    Some(format!("cd -- '{escaped}'"))
+}
+
+#[cfg(test)]
+mod sleep_and_cd_tests {
+    use super::{awake_monotonic_duration, build_remote_cd_command, detect_system_sleep_gap};
+    use std::time::Duration;
+
+    #[test]
+    fn detect_system_sleep_gap_triggers_only_above_threshold() {
+        assert_eq!(
+            detect_system_sleep_gap(
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+                Duration::from_secs(20),
+            ),
+            None
+        );
+        assert_eq!(
+            detect_system_sleep_gap(
+                Duration::from_secs(5),
+                Duration::from_secs(12),
+                Duration::from_secs(20),
+            ),
+            None
+        );
+        assert_eq!(
+            detect_system_sleep_gap(
+                Duration::from_secs(122),
+                Duration::from_secs(2),
+                Duration::from_secs(20),
+            ),
+            Some(120)
+        );
+    }
+
+    #[test]
+    fn awake_monotonic_duration_is_callable() {
+        let _ = awake_monotonic_duration();
+    }
+
+    #[test]
+    fn build_remote_cd_command_escapes_quotes_and_spaces() {
+        assert_eq!(build_remote_cd_command("   "), None);
+        assert_eq!(
+            build_remote_cd_command("/var/log"),
+            Some("cd -- '/var/log'".to_string())
+        );
+        assert_eq!(
+            build_remote_cd_command("/tmp/it's my; $(dir)"),
+            Some("cd -- '/tmp/it'\"'\"'s my; $(dir)'".to_string())
+        );
+    }
 }
 
 #[derive(Debug, Clone, Default)]

@@ -1,6 +1,8 @@
 use gpui::{hsla, rgb, Hsla};
 use serde::{Deserialize, Serialize};
 
+use crate::keybindings::KeyBindingsConfig;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ThemeMode {
@@ -161,6 +163,9 @@ pub struct UiSettings {
     pub auto_lock_minutes: u32,
     pub host_view_grid: bool,
     pub biometric_unlock: bool,
+    pub keybindings: KeyBindingsConfig,
+    pub restore_sessions: bool,
+    pub lock_on_sleep: bool,
 }
 
 impl Default for UiSettings {
@@ -181,6 +186,9 @@ impl Default for UiSettings {
             auto_lock_minutes: 0,
             host_view_grid: false,
             biometric_unlock: false,
+            keybindings: KeyBindingsConfig::default(),
+            restore_sessions: true,
+            lock_on_sleep: true,
         }
     }
 }
