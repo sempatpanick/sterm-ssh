@@ -3,10 +3,12 @@ use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
 use core_ssh::manager::SshSessionManager;
-use dashmap::DashMap;
+use core_ssh::types::SshPeer;
+use dashmap::{DashMap, DashSet};
 use russh_sftp::client::SftpSession;
-use russh_sftp::protocol::{FileAttributes, OpenFlags};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use russh_sftp::client::error::Error as SftpProtocolError;
+use russh_sftp::protocol::{FileAttributes, OpenFlags, StatusCode};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -17,8 +19,28 @@ const CHUNK_SIZE: usize = 64 * 1024;
 const MAX_INLINE_EDIT_BYTES: u64 = 5 * 1024 * 1024; // 5 MiB
 
 pub struct SftpManager {
-    sessions: DashMap<String, Arc<SftpSession>>,
+    sessions: DashMap<String, (Arc<SftpSession>, SshPeer)>,
     transfers: DashMap<String, CancellationToken>,
+    file_destinations: DashSet<FileDestination>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum FileDestination {
+    Local(PathBuf),
+    Remote(SshPeer, String),
+}
+
+struct FileTransferGuard<'a> {
+    manager: &'a SftpManager,
+    transfer_id: String,
+    destination: FileDestination,
+}
+
+impl Drop for FileTransferGuard<'_> {
+    fn drop(&mut self) {
+        self.manager.transfers.remove(&self.transfer_id);
+        self.manager.file_destinations.remove(&self.destination);
+    }
 }
 
 impl Default for SftpManager {
@@ -32,6 +54,7 @@ impl SftpManager {
         Self {
             sessions: DashMap::new(),
             transfers: DashMap::new(),
+            file_destinations: DashSet::new(),
         }
     }
 
@@ -41,13 +64,18 @@ impl SftpManager {
         session_id: &str,
     ) -> SftpResult<String> {
         if let Some(existing) = self.sessions.get(session_id) {
-            let cwd = existing
+            let sftp = Arc::clone(&existing.0);
+            drop(existing);
+            let cwd = sftp
                 .canonicalize(".")
                 .await
                 .unwrap_or_else(|_| "/".to_string());
             return Ok(cwd);
         }
 
+        let peer = ssh
+            .session_peer(session_id)
+            .ok_or_else(|| SftpError::SessionNotFound(session_id.to_string()))?;
         let stream = ssh.open_sftp_stream(session_id).await?;
         let sftp = SftpSession::new(stream)
             .await
@@ -57,19 +85,20 @@ impl SftpManager {
             .await
             .unwrap_or_else(|_| "/".to_string());
 
-        self.sessions.insert(session_id.to_string(), Arc::new(sftp));
+        self.sessions
+            .insert(session_id.to_string(), (Arc::new(sftp), peer));
         Ok(cwd)
     }
 
     fn get_session(&self, session_id: &str) -> SftpResult<Arc<SftpSession>> {
         self.sessions
             .get(session_id)
-            .map(|r| Arc::clone(r.value()))
+            .map(|r| Arc::clone(&r.0))
             .ok_or_else(|| SftpError::SessionNotFound(session_id.to_string()))
     }
 
     pub async fn close(&self, session_id: &str) {
-        if let Some((_, sftp)) = self.sessions.remove(session_id) {
+        if let Some((_, (sftp, _))) = self.sessions.remove(session_id) {
             let _ = sftp.close().await;
         }
     }
@@ -381,7 +410,7 @@ impl SftpManager {
     }
 
     pub fn cancel_transfer(&self, transfer_id: &str) -> bool {
-        if let Some((_, tok)) = self.transfers.remove(transfer_id) {
+        if let Some(tok) = self.transfers.get(transfer_id) {
             tok.cancel();
             true
         } else {
@@ -394,109 +423,20 @@ impl SftpManager {
         session_id: &str,
         local_path: &Path,
         remote_path: &str,
-        mut on_progress: F,
+        on_progress: F,
     ) -> SftpResult<String>
     where
         F: FnMut(TransferProgress),
     {
-        let sftp = self.get_session(session_id)?;
-        let transfer_id = Uuid::now_v7().to_string();
-        let token = CancellationToken::new();
-        self.transfers.insert(transfer_id.clone(), token.clone());
-
-        let meta = tokio::fs::metadata(local_path).await?;
-        let total_bytes = meta.len();
-        let file_name = local_path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "file".to_string());
-
-        let mut local_file = tokio::fs::File::open(local_path).await?;
-        let mut remote_file = sftp
-            .open_with_flags(
-                remote_path,
-                OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
-            )
-            .await
-            .map_err(|e| SftpError::Protocol(e.to_string()))?;
-
-        let mut buf = vec![0u8; CHUNK_SIZE];
-        let mut transferred = 0u64;
-
-        let res: SftpResult<()> = async {
-            loop {
-                if token.is_cancelled() {
-                    return Err(SftpError::Cancelled);
-                }
-                let n = local_file.read(&mut buf).await?;
-                if n == 0 {
-                    break;
-                }
-                remote_file.write_all(&buf[..n]).await?;
-                transferred += n as u64;
-                on_progress(TransferProgress {
-                    transfer_id: transfer_id.clone(),
-                    direction: TransferDirection::Upload,
-                    file_name: file_name.clone(),
-                    local_path: local_path.to_string_lossy().to_string(),
-                    remote_path: remote_path.to_string(),
-                    bytes_transferred: transferred,
-                    total_bytes,
-                    status: TransferStatus::Running,
-                    error: None,
-                });
-            }
-            remote_file.flush().await?;
-            Ok(())
-        }
-        .await;
-
-        self.transfers.remove(&transfer_id);
-
-        match res {
-            Ok(()) => {
-                on_progress(TransferProgress {
-                    transfer_id: transfer_id.clone(),
-                    direction: TransferDirection::Upload,
-                    file_name,
-                    local_path: local_path.to_string_lossy().to_string(),
-                    remote_path: remote_path.to_string(),
-                    bytes_transferred: transferred,
-                    total_bytes,
-                    status: TransferStatus::Completed,
-                    error: None,
-                });
-                Ok(transfer_id)
-            }
-            Err(SftpError::Cancelled) => {
-                on_progress(TransferProgress {
-                    transfer_id: transfer_id.clone(),
-                    direction: TransferDirection::Upload,
-                    file_name,
-                    local_path: local_path.to_string_lossy().to_string(),
-                    remote_path: remote_path.to_string(),
-                    bytes_transferred: transferred,
-                    total_bytes,
-                    status: TransferStatus::Cancelled,
-                    error: None,
-                });
-                Err(SftpError::Cancelled)
-            }
-            Err(e) => {
-                on_progress(TransferProgress {
-                    transfer_id: transfer_id.clone(),
-                    direction: TransferDirection::Upload,
-                    file_name,
-                    local_path: local_path.to_string_lossy().to_string(),
-                    remote_path: remote_path.to_string(),
-                    bytes_transferred: transferred,
-                    total_bytes,
-                    status: TransferStatus::Failed,
-                    error: Some(e.to_string()),
-                });
-                Err(e)
-            }
-        }
+        let name = local_path.file_name().unwrap_or_default().to_string_lossy();
+        self.transfer_file(
+            session_id,
+            local_path,
+            new_file_transfer(TransferDirection::Upload, &name, local_path, remote_path),
+            false,
+            on_progress,
+        )
+        .await
     }
 
     pub async fn download_file<F>(
@@ -504,114 +444,121 @@ impl SftpManager {
         session_id: &str,
         remote_path: &str,
         local_path: &Path,
-        mut on_progress: F,
+        on_progress: F,
     ) -> SftpResult<String>
     where
         F: FnMut(TransferProgress),
     {
-        let sftp = self.get_session(session_id)?;
-        let transfer_id = Uuid::now_v7().to_string();
+        let name = remote_path.rsplit('/').next().unwrap_or("file");
+        self.transfer_file(
+            session_id,
+            local_path,
+            new_file_transfer(TransferDirection::Download, name, local_path, remote_path),
+            false,
+            on_progress,
+        )
+        .await
+    }
+
+    /// Retries a file on its original SSH peer and paths, keeping its transfer ID.
+    pub async fn retry_file<F>(
+        &self,
+        session_id: &str,
+        transfer: TransferProgress,
+        on_progress: F,
+    ) -> SftpResult<String>
+    where
+        F: FnMut(TransferProgress),
+    {
+        if !matches!(transfer.status, TransferStatus::Failed) || transfer.retry_peer.is_none() {
+            return Err(SftpError::Protocol(
+                "This file transfer cannot be retried.".into(),
+            ));
+        }
+        let local_path = PathBuf::from(&transfer.local_path);
+        self.transfer_file(session_id, &local_path, transfer, true, on_progress)
+            .await
+    }
+
+    async fn transfer_file(
+        &self,
+        session_id: &str,
+        local_path: &Path,
+        mut progress: TransferProgress,
+        resume: bool,
+        mut on_progress: impl FnMut(TransferProgress),
+    ) -> SftpResult<String> {
+        let (sftp, peer) = self
+            .sessions
+            .get(session_id)
+            .map(|entry| entry.value().clone())
+            .ok_or_else(|| SftpError::SessionNotFound(session_id.to_string()))?;
+        if resume && progress.retry_peer.as_ref() != Some(&peer) {
+            return Err(SftpError::Protocol(
+                "Reconnect to the original SSH server and account to retry this transfer.".into(),
+            ));
+        }
+        let remote_path = progress.remote_path.clone();
+        let destination = match progress.direction {
+            TransferDirection::Upload => FileDestination::Remote(peer.clone(), remote_path.clone()),
+            TransferDirection::Download => FileDestination::Local(local_path.to_path_buf()),
+        };
+        if !self.file_destinations.insert(destination.clone()) {
+            return Err(SftpError::Protocol(
+                "A file transfer is already writing to this destination.".into(),
+            ));
+        }
+        let transfer_id = progress.transfer_id.clone();
         let token = CancellationToken::new();
         self.transfers.insert(transfer_id.clone(), token.clone());
+        let registration = FileTransferGuard {
+            manager: self,
+            transfer_id: transfer_id.clone(),
+            destination,
+        };
 
-        let meta = sftp
-            .metadata(remote_path)
-            .await
-            .map_err(|e| SftpError::Protocol(e.to_string()))?;
-        let total_bytes = meta.size.unwrap_or(0);
-        let file_name = remote_path
-            .rsplit('/')
-            .next()
-            .unwrap_or("file")
-            .to_string();
+        progress.retry_peer = Some(peer);
+        progress.status = TransferStatus::Running;
+        progress.error = None;
+        on_progress(progress.clone());
 
-        if let Some(parent) = local_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        let mut remote_file = sftp
-            .open(remote_path)
-            .await
-            .map_err(|e| SftpError::Protocol(e.to_string()))?;
-        let mut local_file = tokio::fs::File::create(local_path).await?;
-
-        let mut buf = vec![0u8; CHUNK_SIZE];
-        let mut transferred = 0u64;
-
-        let res: SftpResult<()> = async {
-            loop {
-                if token.is_cancelled() {
-                    return Err(SftpError::Cancelled);
-                }
-                let n = remote_file.read(&mut buf).await?;
-                if n == 0 {
-                    break;
-                }
-                local_file.write_all(&buf[..n]).await?;
-                transferred += n as u64;
-                on_progress(TransferProgress {
-                    transfer_id: transfer_id.clone(),
-                    direction: TransferDirection::Download,
-                    file_name: file_name.clone(),
-                    local_path: local_path.to_string_lossy().to_string(),
-                    remote_path: remote_path.to_string(),
-                    bytes_transferred: transferred,
-                    total_bytes,
-                    status: TransferStatus::Running,
-                    error: None,
-                });
+        let result = match progress.direction {
+            TransferDirection::Upload => {
+                upload_file_data(
+                    &sftp,
+                    local_path,
+                    &remote_path,
+                    resume,
+                    &token,
+                    &mut progress,
+                    &mut on_progress,
+                )
+                .await
             }
-            local_file.flush().await?;
-            Ok(())
-        }
-        .await;
-
-        self.transfers.remove(&transfer_id);
-
-        match res {
-            Ok(()) => {
-                on_progress(TransferProgress {
-                    transfer_id: transfer_id.clone(),
-                    direction: TransferDirection::Download,
-                    file_name,
-                    local_path: local_path.to_string_lossy().to_string(),
-                    remote_path: remote_path.to_string(),
-                    bytes_transferred: transferred,
-                    total_bytes,
-                    status: TransferStatus::Completed,
-                    error: None,
-                });
-                Ok(transfer_id)
+            TransferDirection::Download => {
+                download_file_data(
+                    &sftp,
+                    &remote_path,
+                    local_path,
+                    resume,
+                    &token,
+                    &mut progress,
+                    &mut on_progress,
+                )
+                .await
             }
-            Err(SftpError::Cancelled) => {
-                let _ = tokio::fs::remove_file(local_path).await;
-                on_progress(TransferProgress {
-                    transfer_id: transfer_id.clone(),
-                    direction: TransferDirection::Download,
-                    file_name,
-                    local_path: local_path.to_string_lossy().to_string(),
-                    remote_path: remote_path.to_string(),
-                    bytes_transferred: transferred,
-                    total_bytes,
-                    status: TransferStatus::Cancelled,
-                    error: None,
-                });
-                Err(SftpError::Cancelled)
+        };
+        progress.status = match &result {
+            Ok(()) => TransferStatus::Completed,
+            Err(SftpError::Cancelled) => TransferStatus::Cancelled,
+            Err(error) => {
+                progress.error = Some(error.to_string());
+                TransferStatus::Failed
             }
-            Err(e) => {
-                on_progress(TransferProgress {
-                    transfer_id: transfer_id.clone(),
-                    direction: TransferDirection::Download,
-                    file_name,
-                    local_path: local_path.to_string_lossy().to_string(),
-                    remote_path: remote_path.to_string(),
-                    bytes_transferred: transferred,
-                    total_bytes,
-                    status: TransferStatus::Failed,
-                    error: Some(e.to_string()),
-                });
-                Err(e)
-            }
-        }
+        };
+        drop(registration);
+        on_progress(progress);
+        result.map(|()| transfer_id)
     }
 
     /// Streams a file directly from one remote SFTP host (`src_session_id`) to another
@@ -673,6 +620,7 @@ impl SftpManager {
                     total_bytes,
                     status: TransferStatus::Running,
                     error: None,
+                    retry_peer: None,
                 });
             }
             dst_file.flush().await?;
@@ -694,6 +642,7 @@ impl SftpManager {
                     total_bytes,
                     status: TransferStatus::Completed,
                     error: None,
+                    retry_peer: None,
                 });
                 Ok(transfer_id)
             }
@@ -708,6 +657,7 @@ impl SftpManager {
                     total_bytes,
                     status: TransferStatus::Cancelled,
                     error: None,
+                    retry_peer: None,
                 });
                 Err(SftpError::Cancelled)
             }
@@ -722,6 +672,7 @@ impl SftpManager {
                     total_bytes,
                     status: TransferStatus::Failed,
                     error: Some(e.to_string()),
+                    retry_peer: None,
                 });
                 Err(e)
             }
@@ -782,6 +733,216 @@ fn strip_surrounding_quotes(s: &str) -> &str {
         s
     }
 }
+
+fn new_file_transfer(
+    direction: TransferDirection,
+    file_name: &str,
+    local_path: &Path,
+    remote_path: &str,
+) -> TransferProgress {
+    TransferProgress {
+        transfer_id: Uuid::now_v7().to_string(),
+        direction,
+        file_name: file_name.to_owned(),
+        local_path: local_path.to_string_lossy().into_owned(),
+        remote_path: remote_path.to_owned(),
+        bytes_transferred: 0,
+        total_bytes: 0,
+        status: TransferStatus::Running,
+        error: None,
+        retry_peer: None,
+    }
+}
+
+async fn upload_file_data(
+    sftp: &SftpSession,
+    local_path: &Path,
+    remote_path: &str,
+    resume: bool,
+    token: &CancellationToken,
+    progress: &mut TransferProgress,
+    on_progress: &mut impl FnMut(TransferProgress),
+) -> SftpResult<()> {
+    let mut source = tokio::fs::File::open(local_path).await?;
+    let total = source.metadata().await?.len();
+    let flags = if resume {
+        match sftp.symlink_metadata(remote_path).await {
+            Ok(attrs) if attrs.is_symlink() => return Err(partial_file_changed()),
+            Ok(_) => OpenFlags::READ | OpenFlags::WRITE,
+            Err(SftpProtocolError::Status(status))
+                if status.status_code == StatusCode::NoSuchFile =>
+            {
+                OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE
+            }
+            Err(error) => return Err(SftpError::Protocol(error.to_string())),
+        }
+    } else {
+        OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE
+    };
+    let mut destination = sftp
+        .open_with_flags(remote_path, flags)
+        .await
+        .map_err(|error| SftpError::Protocol(error.to_string()))?;
+    let offset = if resume && flags.contains(OpenFlags::READ) {
+        destination
+            .metadata()
+            .await
+            .map_err(|error| SftpError::Protocol(error.to_string()))?
+            .size
+            .ok_or_else(partial_file_changed)?
+    } else {
+        0
+    };
+    if offset > total {
+        return Err(partial_file_changed());
+    }
+    verify_partial_file(&mut source, &mut destination, offset, token).await?;
+    progress.total_bytes = total;
+    copy_file_data(
+        &mut source,
+        &mut destination,
+        offset,
+        token,
+        progress,
+        on_progress,
+    )
+    .await?;
+    destination.close().await?;
+    if progress.bytes_transferred != total {
+        return Err(partial_file_changed());
+    }
+    Ok(())
+}
+
+async fn download_file_data(
+    sftp: &SftpSession,
+    remote_path: &str,
+    local_path: &Path,
+    resume: bool,
+    token: &CancellationToken,
+    progress: &mut TransferProgress,
+    on_progress: &mut impl FnMut(TransferProgress),
+) -> SftpResult<()> {
+    if let Some(parent) = local_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let mut source = sftp
+        .open(remote_path)
+        .await
+        .map_err(|error| SftpError::Protocol(error.to_string()))?;
+    let total = source
+        .metadata()
+        .await
+        .map_err(|error| SftpError::Protocol(error.to_string()))?
+        .size;
+    let mut destination = if resume {
+        let mut options = tokio::fs::OpenOptions::new();
+        options.read(true).write(true);
+        match tokio::fs::symlink_metadata(local_path).await {
+            Ok(attrs) if !attrs.is_file() => return Err(partial_file_changed()),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                options.create_new(true);
+            }
+            Err(error) => return Err(error.into()),
+        }
+        options.open(local_path).await?
+    } else {
+        tokio::fs::File::create(local_path).await?
+    };
+    let offset = if resume {
+        destination.metadata().await?.len()
+    } else {
+        0
+    };
+    if total.is_some_and(|size| offset > size) {
+        return Err(partial_file_changed());
+    }
+    verify_partial_file(&mut source, &mut destination, offset, token).await?;
+    progress.total_bytes = total.unwrap_or_default();
+    let result = copy_file_data(
+        &mut source,
+        &mut destination,
+        offset,
+        token,
+        progress,
+        on_progress,
+    )
+    .await;
+    drop(destination);
+    if !resume && matches!(result, Err(SftpError::Cancelled)) {
+        let _ = tokio::fs::remove_file(local_path).await;
+    }
+    result?;
+    if total.is_some_and(|size| size != progress.bytes_transferred) {
+        return Err(partial_file_changed());
+    }
+    Ok(())
+}
+
+fn partial_file_changed() -> SftpError {
+    SftpError::Protocol("The destination is not an intact prefix of the source. Start a new transfer to replace it.".into())
+}
+
+/// Check the actual on-disk prefix before writing any new bytes, and leave both handles at its end.
+async fn verify_partial_file(
+    source: &mut (impl AsyncRead + Unpin),
+    destination: &mut (impl AsyncRead + Unpin),
+    mut remaining: u64,
+    token: &CancellationToken,
+) -> SftpResult<()> {
+    if remaining == 0 {
+        return Ok(());
+    }
+    let mut original = vec![0; CHUNK_SIZE];
+    let mut partial = vec![0; CHUNK_SIZE];
+    while remaining > 0 {
+        if token.is_cancelled() {
+            return Err(SftpError::Cancelled);
+        }
+        let chunk = remaining.min(CHUNK_SIZE as u64) as usize;
+        tokio::try_join!(
+            source.read_exact(&mut original[..chunk]),
+            destination.read_exact(&mut partial[..chunk])
+        )?;
+        if original[..chunk] != partial[..chunk] {
+            return Err(partial_file_changed());
+        }
+        remaining -= chunk as u64;
+    }
+    Ok(())
+}
+
+async fn copy_file_data(
+    source: &mut (impl AsyncRead + Unpin),
+    destination: &mut (impl AsyncWrite + Unpin),
+    offset: u64,
+    token: &CancellationToken,
+    progress: &mut TransferProgress,
+    on_progress: &mut impl FnMut(TransferProgress),
+) -> SftpResult<()> {
+    progress.bytes_transferred = offset;
+    on_progress(progress.clone());
+    let mut buffer = vec![0; CHUNK_SIZE];
+    loop {
+        if token.is_cancelled() {
+            return Err(SftpError::Cancelled);
+        }
+        let count = source.read(&mut buffer).await?;
+        if count == 0 {
+            break;
+        }
+        destination.write_all(&buffer[..count]).await?;
+        progress.bytes_transferred += count as u64;
+        on_progress(progress.clone());
+    }
+    destination.flush().await?;
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "resume_tests.rs"]
+mod resume_tests;
 
 fn normalize_local_dir_path(path: &str) -> PathBuf {
     let trimmed = strip_surrounding_quotes(path.trim()).trim();

@@ -202,6 +202,7 @@ mod tab_reorder_tests {
 pub struct SftpWorkspaceState {
     pub session_id: Option<String>,
     pub host_id: Option<String>,
+    pub connected_host_id: Option<String>,
     pub host_label: Option<String>,
     /// Optional left-pane remote SFTP session for Any-to-Any (Remote ↔ Remote) transfers.
     pub left_remote_session_id: Option<String>,
@@ -222,7 +223,7 @@ pub struct SftpWorkspaceState {
     pub loading_local: bool,
     pub loading_remote: bool,
     pub transfers: Vec<TransferProgress>,
-    pub transfer_started_at: HashMap<String, Instant>,
+    pub transfer_started_at: HashMap<String, (Instant, u64)>,
 }
 
 impl SftpWorkspaceState {
@@ -230,6 +231,7 @@ impl SftpWorkspaceState {
         Self {
             session_id: None,
             host_id: None,
+            connected_host_id: None,
             host_label: None,
             left_remote_session_id: None,
             left_remote_host_id: None,
@@ -290,6 +292,11 @@ impl SftpWorkspaceState {
     pub fn clear_finished_transfers(&mut self) {
         self.transfers
             .retain(|t| matches!(t.status, TransferStatus::Running));
+        self.transfer_started_at.retain(|id, _| {
+            self.transfers
+                .iter()
+                .any(|transfer| &transfer.transfer_id == id)
+        });
     }
 
     pub fn reset_local_scroll(&self) {
@@ -309,9 +316,17 @@ impl SftpWorkspaceState {
     }
 
     pub fn upsert_transfer(&mut self, progress: TransferProgress) {
-        self.transfer_started_at
-            .entry(progress.transfer_id.clone())
-            .or_insert_with(Instant::now);
+        if matches!(progress.status, TransferStatus::Running) {
+            let sample = self
+                .transfer_started_at
+                .entry(progress.transfer_id.clone())
+                .or_insert_with(|| (Instant::now(), progress.bytes_transferred));
+            if sample.1 > progress.bytes_transferred {
+                *sample = (Instant::now(), progress.bytes_transferred);
+            }
+        } else {
+            self.transfer_started_at.remove(&progress.transfer_id);
+        }
         if let Some(existing) = self
             .transfers
             .iter_mut()
@@ -331,12 +346,12 @@ impl SftpWorkspaceState {
         if !matches!(tr.status, TransferStatus::Running) || tr.bytes_transferred == 0 {
             return None;
         }
-        let started = self.transfer_started_at.get(&tr.transfer_id)?;
+        let (started, initial_bytes) = self.transfer_started_at.get(&tr.transfer_id)?;
         let elapsed = started.elapsed().as_secs_f64();
         if elapsed < 0.05 {
             return None;
         }
-        let bps = (tr.bytes_transferred as f64 / elapsed) as u64;
+        let bps = (tr.bytes_transferred.saturating_sub(*initial_bytes) as f64 / elapsed) as u64;
         if bps == 0 {
             return None;
         }
@@ -510,6 +525,7 @@ mod tests {
             total_bytes: 100,
             status: TransferStatus::Running,
             error: None,
+            retry_peer: None,
         };
         assert_eq!(transfer_percent(&running), 75);
 
@@ -559,6 +575,7 @@ mod tests {
             total_bytes: 10,
             status: TransferStatus::Completed,
             error: None,
+            retry_peer: None,
         });
         st.upsert_transfer(TransferProgress {
             transfer_id: "active".into(),
@@ -570,6 +587,7 @@ mod tests {
             total_bytes: 10,
             status: TransferStatus::Running,
             error: None,
+            retry_peer: None,
         });
         st.clear_finished_transfers();
         assert_eq!(st.transfers.len(), 1);

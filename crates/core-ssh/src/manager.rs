@@ -30,7 +30,7 @@ use uuid::Uuid;
 
 use crate::types::{
     AgentIdentityInfo, ConnectRequest, HostKeyChallenge, HostKeyStatus,
-    KeyboardInteractiveChallenge, KeyboardInteractivePrompt, SshAuthMethod, SshTarget,
+    KeyboardInteractiveChallenge, KeyboardInteractivePrompt, SshAuthMethod, SshPeer, SshTarget,
     TerminalEvent, TunnelKind, TunnelStats,
 };
 use crate::{SshError, SshResult};
@@ -101,6 +101,7 @@ struct StermClientHandler {
     hostname: String,
     port: u16,
     verifier: Arc<dyn HostKeyVerifier>,
+    host_key_fingerprint: Arc<Mutex<Option<String>>>,
     disconnect_reason: Arc<Mutex<Option<String>>>,
     remote_forwards: RemoteForwardMap,
     forward_agent: bool,
@@ -115,6 +116,10 @@ impl client::Handler for StermClientHandler {
     ) -> Result<bool, Self::Error> {
         let server_key = server_public_key.public_key();
         let fingerprint = server_key.fingerprint(HashAlg::Sha256).to_string();
+        // A connection is published only after host key verification and authentication succeed.
+        if let Ok(mut key) = self.host_key_fingerprint.lock() {
+            *key = Some(fingerprint.clone());
+        }
         let algorithm = server_key.algorithm().to_string();
         let public_key_b64 = B64.encode(server_key.public_key_bytes());
 
@@ -293,6 +298,7 @@ enum ShellControl {
 
 struct ActiveSession {
     handle: Arc<Handle<StermClientHandler>>,
+    peer: SshPeer,
     /// Keep jump host handles alive for the lifetime of the tunneled session.
     _jump_handles: Vec<Handle<StermClientHandler>>,
     shell_tx: Option<mpsc::Sender<ShellControl>>,
@@ -640,6 +646,7 @@ impl SshSessionManager {
         Handle<StermClientHandler>,
         Arc<Mutex<Option<String>>>,
         RemoteForwardMap,
+        SshPeer,
     )> {
         let mut config = client::Config {
             nodelay: true,
@@ -656,11 +663,13 @@ impl SshSessionManager {
         }
         let config = Arc::new(config);
         let disconnect_reason = Arc::new(Mutex::new(None));
+        let host_key_fingerprint = Arc::new(Mutex::new(None));
         let remote_forwards: RemoteForwardMap = Arc::new(DashMap::new());
         let handler = StermClientHandler {
             hostname: target.hostname.clone(),
             port: target.port,
             verifier: Arc::clone(&verifier),
+            host_key_fingerprint: Arc::clone(&host_key_fingerprint),
             disconnect_reason: Arc::clone(&disconnect_reason),
             remote_forwards: Arc::clone(&remote_forwards),
             forward_agent: target.forward_agent,
@@ -696,7 +705,17 @@ impl SshSessionManager {
         };
 
         Self::authenticate(&mut handle, target, verifier.as_ref()).await?;
-        Ok((handle, disconnect_reason, remote_forwards))
+        let peer = SshPeer {
+            hostname: target.hostname.clone(),
+            port: target.port,
+            username: target.username.clone(),
+            host_key_fingerprint: host_key_fingerprint
+                .lock()
+                .map_err(|_| SshError::Connect("Could not read the verified host key.".into()))?
+                .clone()
+                .ok_or_else(|| SshError::Connect("The server did not supply a host key.".into()))?,
+        };
+        Ok((handle, disconnect_reason, remote_forwards, peer))
     }
 
     async fn try_agent_identities<S>(
@@ -984,7 +1003,7 @@ impl SshSessionManager {
     where
         F: FnMut(TerminalEvent) + Send + 'static,
     {
-        let (target_handle, jump_handles, disconnect_reason, remote_forwards) =
+        let (target_handle, jump_handles, disconnect_reason, remote_forwards, peer) =
             self.connect_chain(&req, verifier).await?;
         let target_handle = Arc::new(target_handle);
 
@@ -1025,6 +1044,7 @@ impl SshSessionManager {
             session_id.clone(),
             ActiveSession {
                 handle: Arc::clone(&target_handle),
+                peer,
                 _jump_handles: jump_handles,
                 shell_tx: Some(ctrl_tx),
                 remote_forwards,
@@ -1096,13 +1116,14 @@ impl SshSessionManager {
         req: ConnectRequest,
         verifier: Arc<dyn HostKeyVerifier>,
     ) -> SshResult<String> {
-        let (target_handle, jump_handles, _disconnect_reason, remote_forwards) =
+        let (target_handle, jump_handles, _disconnect_reason, remote_forwards, peer) =
             self.connect_chain(&req, verifier).await?;
         let session_id = Uuid::now_v7().to_string();
         self.sessions.insert(
             session_id.clone(),
             ActiveSession {
                 handle: Arc::new(target_handle),
+                peer,
                 _jump_handles: jump_handles,
                 shell_tx: None,
                 remote_forwards,
@@ -1119,7 +1140,7 @@ impl SshSessionManager {
         verifier: Arc<dyn HostKeyVerifier>,
         command: &str,
     ) -> SshResult<(u32, String)> {
-        let (target_handle, _jump_handles, _, _) = self.connect_chain(&req, verifier).await?;
+        let (target_handle, _jump_handles, _, _, _) = self.connect_chain(&req, verifier).await?;
         let mut channel = target_handle
             .channel_open_session()
             .await
@@ -1155,23 +1176,32 @@ impl SshSessionManager {
         Vec<Handle<StermClientHandler>>,
         Arc<Mutex<Option<String>>>,
         RemoteForwardMap,
+        SshPeer,
     )> {
         let mut jump_handles: Vec<Handle<StermClientHandler>> = Vec::new();
 
         for hop in &req.jump_chain {
-            let (h, _, _) =
+            let (h, _, _, _) =
                 Self::connect_single(hop, Arc::clone(&verifier), jump_handles.last()).await?;
             jump_handles.push(h);
         }
 
-        let (target_handle, disconnect_reason, remote_forwards) =
+        let (target_handle, disconnect_reason, remote_forwards, peer) =
             Self::connect_single(&req.target, verifier, jump_handles.last()).await?;
         Ok((
             target_handle,
             jump_handles,
             disconnect_reason,
             remote_forwards,
+            peer,
         ))
+    }
+
+    pub fn session_peer(&self, session_id: &str) -> Option<SshPeer> {
+        self.sessions
+            .get(session_id)
+            .filter(|session| !session.handle.is_closed())
+            .map(|session| session.peer.clone())
     }
 
     /// Initiates an SSH transport key re-exchange on an active session.

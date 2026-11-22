@@ -68,6 +68,7 @@ pub enum UiEvent {
     KbiPrompt(KeyboardInteractiveChallenge),
     SftpConnected {
         session_id: String,
+        host_id: Option<String>,
         host_label: String,
         remote_cwd: String,
         local_cwd: String,
@@ -83,6 +84,11 @@ pub enum UiEvent {
         entries: Vec<FileEntry>,
     },
     SftpTransfer(TransferProgress),
+    SftpFileTransfer {
+        tab_id: String,
+        session_id: String,
+        progress: TransferProgress,
+    },
     SftpRemoteTextLoaded {
         session_id: String,
         remote_path: String,

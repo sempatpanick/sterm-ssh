@@ -1,3 +1,4 @@
+use core_ssh::types::SshPeer;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,4 +39,6 @@ pub struct TransferProgress {
     pub total_bytes: u64,
     pub status: TransferStatus,
     pub error: Option<String>,
+    #[serde(skip)]
+    pub retry_peer: Option<SshPeer>,
 }

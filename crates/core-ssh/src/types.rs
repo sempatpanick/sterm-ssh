@@ -31,6 +31,14 @@ pub struct SshTarget {
     pub proxy_url: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SshPeer {
+    pub hostname: String,
+    pub port: u16,
+    pub username: String,
+    pub host_key_fingerprint: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentIdentityInfo {
     pub comment: String,

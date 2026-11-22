@@ -3568,6 +3568,24 @@ impl StermAdminApp {
                                     .items_center()
                                     .gap_2()
                                     .child(div().w(px(220.0)).child(self.sftp_host_filter.clone()))
+                                    .when(self.bookmark_host().is_some(), |bar| {
+                                        bar.child(
+                                            div()
+                                                .id("sftp-bookmarks")
+                                                .px_2p5()
+                                                .py_1()
+                                                .rounded_lg()
+                                                .border_1()
+                                                .border_color(t.border)
+                                                .bg(t.bg_subtle)
+                                                .text_xs()
+                                                .text_color(t.text_secondary)
+                                                .cursor_pointer()
+                                                .hover(|s| s.border_color(t.accent).text_color(t.accent))
+                                                .on_click(cx.listener(|this, _, _, cx| this.open_sftp_bookmarks(cx)))
+                                                .child("Bookmarks"),
+                                        )
+                                    })
                                     .child(
                                         div()
                                             .id("sftp-toggle-hidden")
@@ -6356,7 +6374,7 @@ impl StermAdminApp {
                                             })
                                             .child(loading_dots_indexed("tr-dots", ix, t.accent))
                                             .into_any_element()
-                                    } else if failed {
+                                    } else if failed && tr.retry_peer.is_some() {
                                         div()
                                             .flex()
                                             .items_center()

@@ -288,6 +288,9 @@ pub enum ConfirmAction {
         id: String,
         label: String,
     },
+    DeleteNamedWorkspace {
+        name: String,
+    },
     DeleteRemoteFile {
         path: String,
         is_dir: bool,
@@ -304,10 +307,39 @@ pub enum ConfirmAction {
     SignOut,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PasteTarget {
+    pane_id: String,
+    session_id: String,
+    pub label: String,
+    is_local: bool,
+    pub is_production: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SftpBookmark {
+    pub local_path: String,
+    pub remote_path: String,
+}
+
 #[derive(Debug, Clone)]
 pub enum ActiveModal {
     CommandPalette,
+    SaveNamedWorkspace {
+        root: SavedPaneNode,
+        error: Option<String>,
+    },
     QuickConnect,
+    PastePreview {
+        pane_id: String,
+        text: String,
+        targets: Vec<PasteTarget>,
+    },
+    SftpBookmarks {
+        host_id: String,
+        bookmarks: Vec<SftpBookmark>,
+        opening: bool,
+    },
     HostEditor {
         editing_id: Option<String>,
     },
@@ -415,6 +447,8 @@ pub struct StermAdminApp {
 
     // Command Palette (Ctrl/Cmd+K)
     pub palette_query: Entity<TextField>,
+    pub named_workspace_name: Entity<TextField>,
+    pub named_workspaces: Vec<SavedWorkspaceTab>,
     pub palette_quick_auth: CredentialKind,
     pub palette_quick_password: Entity<TextField>,
 
@@ -603,6 +637,7 @@ impl StermAdminApp {
         let palette_query = cx.new(|cx| {
             TextField::new("Search hosts, snippets, or type user@host:22...", cx)
         });
+        let named_workspace_name = cx.new(|cx| TextField::new("Workspace name", cx));
         let palette_quick_password = cx.new(|cx| {
             TextField::new("Password (optional)", cx)
                 .with_masked(true)
@@ -779,6 +814,20 @@ impl StermAdminApp {
             }
         })
         .detach();
+        cx.subscribe(
+            &named_workspace_name,
+            |this, _, ev: &TextFieldEvent, cx| match ev {
+                TextFieldEvent::Submit(_) => this.save_named_workspace(cx),
+                TextFieldEvent::Changed(_) => {
+                    if let Some(ActiveModal::SaveNamedWorkspace { error, .. }) = &mut this.modal {
+                        *error = None;
+                        cx.notify();
+                    }
+                }
+                TextFieldEvent::Cancel => {}
+            },
+        )
+        .detach();
 
         cx.subscribe(
             &palette_quick_password,
@@ -935,6 +984,8 @@ impl StermAdminApp {
             pending_kbi: VecDeque::new(),
             kbi_inputs: Vec::new(),
             palette_query,
+            named_workspace_name,
+            named_workspaces: Vec::new(),
             palette_quick_auth: CredentialKind::Password,
             palette_quick_password,
             auth_mode: initial_auth_mode,
@@ -1099,11 +1150,13 @@ impl StermAdminApp {
         cx.notify();
     }
 
-    pub fn open_command_palette(&mut self, cx: &mut Context<Self>) {
+    pub fn open_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.load_named_workspaces();
         self.palette_query.update(cx, |f, cx| f.clear(cx));
         self.palette_quick_password.update(cx, |f, cx| f.clear(cx));
         self.palette_quick_auth = CredentialKind::Password;
         self.open_modal(ActiveModal::CommandPalette, cx);
+        cx.focus_view(&self.palette_query, window);
     }
 
     pub fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
@@ -1147,6 +1200,7 @@ impl StermAdminApp {
             &self.snippet_cmd_input,
             &self.snippet_label_input,
             &self.palette_query,
+            &self.named_workspace_name,
             &self.palette_quick_password,
             &self.term_search_input,
             &self.term_retry_password,
@@ -1791,6 +1845,7 @@ impl StermAdminApp {
         }
         self.recording_shortcut = None;
         self.modal = None;
+        self.named_workspaces.clear();
         self.reload_vault_snapshot();
         self.set_toast("Vault locked.", false);
         cx.notify();
@@ -1824,6 +1879,9 @@ impl StermAdminApp {
             ConfirmAction::DeleteTunnel { id, label } => {
                 self.stop_port_forward(id.clone(), label.clone(), cx);
                 self.delete_vault_item(id, &label, cx);
+            }
+            ConfirmAction::DeleteNamedWorkspace { name } => {
+                self.remove_named_workspace(&name, cx);
             }
             ConfirmAction::DeleteRemoteFile { path, is_dir, name } => {
                 self.delete_remote_entry(path, is_dir, name);
@@ -2905,132 +2963,279 @@ impl StermAdminApp {
             return;
         }
 
-        let avail_shells = LocalShellManager::available_shells();
-        let dummy_t = ThemePalette::from_settings(&self.settings);
-        let mut restored_tabs = 0usize;
-
-        for saved_tab in saved.tabs {
-            let mut out_panes = Vec::new();
-            let Some(root) =
-                split_node_from_saved(&saved_tab.root, &self.snapshot.hosts, &mut out_panes)
-            else {
-                continue;
-            };
-            let mut root_opt = Some(root);
-
-            for (pane_id, kind) in out_panes {
-                match kind {
-                    RestorePaneKind::Local {
-                        program,
-                        label,
-                        cwd,
-                    } => {
-                        let shell = avail_shells
-                            .iter()
-                            .find(|s| {
-                                program.as_deref() == Some(s.program.as_str())
-                                    || label.as_deref() == Some(s.label.as_str())
-                            })
-                            .cloned()
-                            .unwrap_or_else(LocalShellManager::default_shell);
-                        let initial_dir = cwd
-                            .as_deref()
-                            .map(std::path::PathBuf::from)
-                            .filter(|p| p.is_dir());
-                        let ui_tx = self.services.ui_tx.clone();
-                        let pane_for_stream = pane_id.clone();
-                        match self.services.local_shells.spawn(
-                            &shell,
-                            initial_dir,
-                            DEFAULT_TERM_COLS,
-                            DEFAULT_TERM_ROWS,
-                            move |ev| {
-                                let _ = ui_tx.send(UiEvent::TerminalOutput {
-                                    tab_id: pane_for_stream.clone(),
-                                    event: ev,
-                                });
-                            },
-                        ) {
-                            Ok(sid) => {
-                                let mut pane = TerminalTab::local_shell(
-                                    pane_id,
-                                    shell.label,
-                                    sid,
-                                    shell.program,
-                                );
-                                pane.line_height_mult = self.settings.terminal_line_height;
-                                self.terminal_tabs.push(pane);
-                            }
-                            Err(_) => {
-                                root_opt = root_opt.and_then(|r| tree_close_pane(r, &pane_id));
-                            }
-                        }
-                    }
-                    RestorePaneKind::Ssh { host_id } => {
-                        let built = self.services.vault.lock().ok().and_then(|v| {
-                            build_connect_request_for_host(
-                                &v,
-                                &host_id,
-                                DEFAULT_TERM_COLS as u32,
-                                DEFAULT_TERM_ROWS as u32,
-                                None,
-                            )
-                            .ok()
-                        });
-                        if let Some((host, req)) = built {
-                            let mut pane = TerminalTab::connecting(
-                                pane_id.clone(),
-                                Some(host.id.clone()),
-                                host.label.clone(),
-                                host.hostname.clone(),
-                                host.port,
-                                host.username.clone(),
-                            );
-                            let group_name = host
-                                .group_id
-                                .as_deref()
-                                .and_then(|gid| {
-                                    self.snapshot.groups.iter().find(|g| g.id == gid)
-                                })
-                                .map(|g| g.name.as_str());
-                            pane.env_label = env_badge_for_host(&host.tags, group_name, &dummy_t)
-                                .map(|(_, lbl)| lbl);
-                            pane.theme_id = host.terminal_theme.clone();
-                            pane.line_height_mult = self.settings.terminal_line_height;
-                            self.terminal_tabs.push(pane);
-                            self.spawn_ssh_for_pane(pane_id, req, host.label, None);
-                        } else {
-                            root_opt = root_opt.and_then(|r| tree_close_pane(r, &pane_id));
-                        }
-                    }
+        let mut restored_tabs = 0;
+        for (index, tab) in saved.tabs.into_iter().enumerate() {
+            if let Some(id) = self.restore_workspace_tab(tab) {
+                restored_tabs += 1;
+                if saved.active_tab_index == Some(index) {
+                    self.active_workspace_tab_id = Some(id);
+                    self.focused_pane_tab_id = self.active_pane_id();
                 }
             }
-
-            if let Some(final_root) = root_opt {
-                let pane_ids = collect_pane_ids(&final_root);
-                let active_pane_id = pane_ids.into_iter().next().unwrap_or_default();
-                self.workspace_tabs.push(WorkspaceTab {
-                    id: Uuid::now_v7().to_string(),
-                    title: saved_tab.title,
-                    root: final_root,
-                    active_pane_id,
-                    broadcast_input: saved_tab.broadcast_input,
-                });
-                restored_tabs += 1;
-            }
         }
-
         if restored_tabs > 0 {
-            if let Some(ix) = saved.active_tab_index
-                && let Some(ws) = self.workspace_tabs.get(ix)
-            {
-                self.active_workspace_tab_id = Some(ws.id.clone());
-                self.focused_pane_tab_id = Some(ws.active_pane_id.clone());
-            }
             self.page_epoch = self.page_epoch.wrapping_add(1);
             self.set_toast(format!("Restored {restored_tabs} workspace tab(s)."), false);
             cx.notify();
         }
+    }
+
+    fn restore_workspace_tab(&mut self, saved_tab: SavedWorkspaceTab) -> Option<String> {
+        let avail_shells = LocalShellManager::available_shells();
+        let dummy_t = ThemePalette::from_settings(&self.settings);
+        let mut out_panes = Vec::new();
+        let root = split_node_from_saved(&saved_tab.root, &self.snapshot.hosts, &mut out_panes)?;
+        let mut root_opt = Some(root);
+
+        for (pane_id, kind) in out_panes {
+            match kind {
+                RestorePaneKind::Local {
+                    program,
+                    label,
+                    cwd,
+                } => {
+                    let shell = avail_shells
+                        .iter()
+                        .find(|s| {
+                            program.as_deref() == Some(s.program.as_str())
+                                || label.as_deref() == Some(s.label.as_str())
+                        })
+                        .cloned()
+                        .unwrap_or_else(LocalShellManager::default_shell);
+                    let initial_dir = cwd
+                        .as_deref()
+                        .map(std::path::PathBuf::from)
+                        .filter(|p| p.is_dir());
+                    let ui_tx = self.services.ui_tx.clone();
+                    let pane_for_stream = pane_id.clone();
+                    match self.services.local_shells.spawn(
+                        &shell,
+                        initial_dir,
+                        DEFAULT_TERM_COLS,
+                        DEFAULT_TERM_ROWS,
+                        move |ev| {
+                            let _ = ui_tx.send(UiEvent::TerminalOutput {
+                                tab_id: pane_for_stream.clone(),
+                                event: ev,
+                            });
+                        },
+                    ) {
+                        Ok(sid) => {
+                            let mut pane =
+                                TerminalTab::local_shell(pane_id, shell.label, sid, shell.program);
+                            pane.line_height_mult = self.settings.terminal_line_height;
+                            self.terminal_tabs.push(pane);
+                        }
+                        Err(_) => {
+                            root_opt = root_opt.and_then(|r| tree_close_pane(r, &pane_id));
+                        }
+                    }
+                }
+                RestorePaneKind::Ssh { host_id } => {
+                    let built = self.services.vault.lock().ok().and_then(|v| {
+                        build_connect_request_for_host(
+                            &v,
+                            &host_id,
+                            DEFAULT_TERM_COLS as u32,
+                            DEFAULT_TERM_ROWS as u32,
+                            None,
+                        )
+                        .ok()
+                    });
+                    if let Some((host, req)) = built {
+                        let mut pane = TerminalTab::connecting(
+                            pane_id.clone(),
+                            Some(host.id.clone()),
+                            host.label.clone(),
+                            host.hostname.clone(),
+                            host.port,
+                            host.username.clone(),
+                        );
+                        let group_name = host
+                            .group_id
+                            .as_deref()
+                            .and_then(|gid| self.snapshot.groups.iter().find(|g| g.id == gid))
+                            .map(|g| g.name.as_str());
+                        pane.env_label = env_badge_for_host(&host.tags, group_name, &dummy_t)
+                            .map(|(_, lbl)| lbl);
+                        pane.theme_id = host.terminal_theme.clone();
+                        pane.line_height_mult = self.settings.terminal_line_height;
+                        self.terminal_tabs.push(pane);
+                        self.spawn_ssh_for_pane(pane_id, req, host.label, None);
+                    } else {
+                        root_opt = root_opt.and_then(|r| tree_close_pane(r, &pane_id));
+                    }
+                }
+            }
+        }
+
+        let root = root_opt?;
+        let active_pane_id = collect_pane_ids(&root).into_iter().next()?;
+        let id = Uuid::now_v7().to_string();
+        self.workspace_tabs.push(WorkspaceTab {
+            id: id.clone(),
+            title: saved_tab.title,
+            root,
+            active_pane_id,
+            broadcast_input: saved_tab.broadcast_input,
+        });
+        Some(id)
+    }
+
+    fn load_named_workspaces(&mut self) {
+        let result = self
+            .services
+            .vault
+            .lock()
+            .map_err(|_| "Vault is unavailable.".to_string())
+            .and_then(|vault| {
+                vault
+                    .get_local_setting("named_workspaces")
+                    .map_err(|error| error.to_string())
+            });
+        match result {
+            Ok(workspaces) => self.named_workspaces = workspaces.unwrap_or_default(),
+            Err(error) => {
+                self.named_workspaces.clear();
+                self.set_toast(format!("Could not load saved workspaces. {error}"), true);
+            }
+        }
+    }
+
+    pub fn prompt_save_named_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace) = self.active_workspace_tab() else {
+            return;
+        };
+        if collect_pane_ids(&workspace.root).iter().any(|id| {
+            !self
+                .terminal_tabs
+                .iter()
+                .any(|pane| &pane.tab_id == id && (pane.is_local || pane.host_id.is_some()))
+        }) {
+            self.set_toast(
+                "Save each Quick Connect host to the vault before saving this workspace.",
+                true,
+            );
+            self.modal = None;
+            cx.notify();
+            return;
+        }
+        if let Some(root) = saved_node_from_split(&workspace.root, &self.terminal_tabs) {
+            self.named_workspace_name
+                .update(cx, |field, cx| field.clear(cx));
+            self.open_modal(ActiveModal::SaveNamedWorkspace { root, error: None }, cx);
+            window.focus(&self.named_workspace_name.read(cx).focus_handle(cx));
+        }
+    }
+
+    pub fn save_named_workspace(&mut self, cx: &mut Context<Self>) {
+        let Some(ActiveModal::SaveNamedWorkspace { root, .. }) = &self.modal else {
+            return;
+        };
+        let name = self
+            .named_workspace_name
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let workspace = SavedWorkspaceTab {
+            title: name.clone(),
+            root: root.clone(),
+            broadcast_input: false,
+        };
+        let result = self.edit_named_workspaces(|workspaces| {
+            if name.is_empty() {
+                return Err("Enter a workspace name.".into());
+            }
+            let key = name.to_lowercase();
+            if workspaces
+                .iter()
+                .any(|existing| existing.title.to_lowercase() == key)
+            {
+                return Err("A workspace already uses that name.".into());
+            }
+            workspaces.push(workspace);
+            workspaces.sort_by_cached_key(|entry| entry.title.to_lowercase());
+            Ok(())
+        });
+        match result {
+            Ok(()) => {
+                self.modal = None;
+                self.set_toast(format!("Saved workspace “{name}”."), false);
+            }
+            Err(message) => {
+                if let Some(ActiveModal::SaveNamedWorkspace { error, .. }) = &mut self.modal {
+                    *error = Some(message);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn remove_named_workspace(&mut self, name: &str, cx: &mut Context<Self>) {
+        match self.edit_named_workspaces(|workspaces| {
+            workspaces.retain(|entry| entry.title != name);
+            Ok(())
+        }) {
+            Ok(()) => self.set_toast(format!("Removed workspace “{name}”."), false),
+            Err(error) => self.set_toast(error, true),
+        }
+        cx.notify();
+    }
+
+    fn edit_named_workspaces(
+        &mut self,
+        edit: impl FnOnce(&mut Vec<SavedWorkspaceTab>) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let workspaces = self
+            .services
+            .vault
+            .lock()
+            .map_err(|_| "Vault is unavailable.".to_string())
+            .and_then(|vault| {
+                let mut workspaces = vault
+                    .get_local_setting("named_workspaces")
+                    .map_err(|error| error.to_string())?
+                    .unwrap_or_default();
+                edit(&mut workspaces)?;
+                vault
+                    .set_local_setting("named_workspaces", &workspaces)
+                    .map_err(|error| error.to_string())?;
+                Ok(workspaces)
+            })?;
+        self.named_workspaces = workspaces;
+        Ok(())
+    }
+
+    pub fn open_named_workspace(
+        &mut self,
+        mut workspace: SavedWorkspaceTab,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.vault_status.unlocked {
+            return;
+        }
+        workspace.broadcast_input = false;
+        let name = workspace.title.clone();
+        self.modal = None;
+        if let Some(id) = self.restore_workspace_tab(workspace) {
+            self.active_workspace_tab_id = Some(id);
+            self.focused_pane_tab_id = self.active_pane_id();
+            self.page_epoch = self.page_epoch.wrapping_add(1);
+            self.persist_workspace_sessions();
+            if let Some(window) = cx.active_window() {
+                let focus = self.terminal_focus.clone();
+                cx.defer(move |cx| {
+                    let _ = window.update(cx, |_, window, _| window.focus(&focus));
+                });
+            }
+        } else {
+            self.set_toast(
+                format!("No panes in workspace “{name}” could be opened."),
+                true,
+            );
+        }
+        cx.notify();
     }
 
     pub fn reconnect_terminal_pane(
@@ -3280,13 +3485,21 @@ impl StermAdminApp {
 
     pub fn submit_palette_primary(&mut self, cx: &mut Context<Self>) {
         let query = self.palette_query.read(cx).value().trim().to_string();
+        let q = query.to_lowercase();
+        if let Some(workspace) = self
+            .named_workspaces
+            .iter()
+            .find(|entry| entry.title.to_lowercase() == q)
+        {
+            self.open_named_workspace(workspace.clone(), cx);
+            return;
+        }
         if let Some((user, host, port)) = Self::parse_quick_target(&query) {
             let pw = self.palette_quick_password.read(cx).value().to_string();
             let auth = self.palette_quick_auth.clone();
             self.launch_quick_connect(host, port, user, auth, pw, None, cx);
             return;
         }
-        let q = query.to_lowercase();
         if let Some(host) = self.snapshot.hosts.iter().find(|h| {
             q.is_empty()
                 || h.label.to_lowercase().contains(&q)
@@ -3460,28 +3673,64 @@ impl StermAdminApp {
     /// Writes terminal input bytes to either the active pane OR all connected panes in the active
     /// workspace when Broadcast Input is enabled (seamlessly routing SSH and Local PTY shells).
     pub fn write_bytes_to_target_panes(&self, active_pane_id: &str, bytes: Vec<u8>) {
-        let broadcast_targets: Vec<String> = self
-            .active_workspace_tab()
+        self.write_terminal_input(
+            self.terminal_input_panes(active_pane_id)
+                .into_iter()
+                .filter_map(|pane| Some((pane.is_local, pane.session_id.clone()?))),
+            &bytes,
+        );
+    }
+
+    fn terminal_input_panes(&self, active_pane_id: &str) -> Vec<&TerminalTab> {
+        self.active_workspace_tab()
             .filter(|ws| ws.broadcast_input)
             .map(|ws| collect_pane_ids(&ws.root))
-            .unwrap_or_else(|| vec![active_pane_id.to_string()]);
+            .unwrap_or_else(|| vec![active_pane_id.to_string()])
+            .into_iter()
+            .filter_map(|id| {
+                self.terminal_tabs
+                    .iter()
+                    .find(|p| p.tab_id == id && p.connected)
+            })
+            .collect()
+    }
 
-        for pid in broadcast_targets {
-            if let Some(pane) = self
-                .terminal_tabs
-                .iter()
-                .find(|p| p.tab_id == pid && p.connected)
-                && let Some(sid) = pane.session_id.clone()
-            {
-                let payload = bytes.clone();
-                if pane.is_local {
-                    let _ = self.services.local_shells.write_input(&sid, &payload);
-                } else {
-                    let services = Arc::clone(&self.services);
-                    self.services.rt.spawn(async move {
-                        let _ = services.ssh.write_input(&sid, payload).await;
-                    });
-                }
+    fn terminal_paste_targets(&self, pane_id: &str) -> Vec<PasteTarget> {
+        self.terminal_input_panes(pane_id)
+            .into_iter()
+            .filter_map(|pane| {
+                Some(PasteTarget {
+                    pane_id: pane.tab_id.clone(),
+                    session_id: pane.session_id.clone()?,
+                    label: if pane.is_local {
+                        pane.label.clone()
+                    } else {
+                        format!(
+                            "{} ({}@{}:{})",
+                            pane.label, pane.username, pane.hostname, pane.port
+                        )
+                    },
+                    is_local: pane.is_local,
+                    is_production: pane.env_label == Some("PROD"),
+                })
+            })
+            .collect()
+    }
+
+    fn write_terminal_input(
+        &self,
+        targets: impl IntoIterator<Item = (bool, String)>,
+        bytes: &[u8],
+    ) {
+        for (is_local, session_id) in targets {
+            if is_local {
+                let _ = self.services.local_shells.write_input(&session_id, bytes);
+            } else {
+                let services = Arc::clone(&self.services);
+                let payload = bytes.to_vec();
+                self.services.rt.spawn(async move {
+                    let _ = services.ssh.write_input(&session_id, payload).await;
+                });
             }
         }
     }
@@ -3643,7 +3892,7 @@ impl StermAdminApp {
         if self.sftp_state.session_id.as_deref() != Some(session_id.as_str()) {
             self.close_previous_sftp_if_standalone();
             self.sftp_state.connecting = true;
-            self.sftp_state.host_id = host_id;
+            self.sftp_state.host_id = host_id.clone();
             self.last_drawer_followed_cwd = pane_cwd.clone();
             let follow_cwd = self.sftp_drawer_follow_cwd;
             let target_sftp_tab = Some(self.active_sftp_tab_id.clone());
@@ -3665,6 +3914,7 @@ impl StermAdminApp {
                             };
                         let _ = services.ui_tx.send(UiEvent::SftpConnected {
                             session_id: session_id.clone(),
+                            host_id,
                             host_label,
                             remote_cwd: effective_cwd.clone(),
                             local_cwd,
@@ -4738,15 +4988,121 @@ impl StermAdminApp {
         cx.notify();
     }
 
-    pub fn retry_failed_transfer(&mut self, tr: TransferProgress, cx: &mut Context<Self>) {
-        match tr.direction {
-            TransferDirection::Upload => {
-                self.upload_local_file(tr.local_path, tr.file_name, cx);
-            }
-            TransferDirection::Download => {
-                self.download_remote_file(tr.remote_path, tr.file_name, cx);
-            }
+    pub fn retry_failed_transfer(&mut self, transfer: TransferProgress, cx: &mut Context<Self>) {
+        let Some(peer) = transfer.retry_peer.as_ref() else {
+            return;
+        };
+        if !self.sftp_state.transfers.iter().any(|entry| {
+            entry.transfer_id == transfer.transfer_id
+                && matches!(entry.status, TransferStatus::Failed)
+        }) {
+            return;
         }
+
+        let session = self.sftp_state.session_id.clone();
+        let current_peer = session
+            .as_deref()
+            .and_then(|id| self.services.ssh.session_peer(id));
+        let reconnect = if let Some(current) = current_peer {
+            if &current != peer {
+                self.set_toast(
+                    "Open the original SFTP server and account to retry this file.",
+                    true,
+                );
+                cx.notify();
+                return;
+            }
+            None
+        } else {
+            let request = self
+                .sftp_state
+                .connected_host_id
+                .as_deref()
+                .and_then(|host_id| {
+                    let vault = self.services.vault.lock().ok()?;
+                    build_connect_request_for_host(&vault, host_id, 80, 24, None)
+                        .ok()
+                        .map(|(_, req)| req)
+                })
+                .filter(|request| {
+                    request.target.hostname == peer.hostname
+                        && request.target.port == peer.port
+                        && request.target.username == peer.username
+                });
+            let Some(request) = request else {
+                self.set_toast(
+                    "Reconnect to the original SFTP server before retrying this file.",
+                    true,
+                );
+                cx.notify();
+                return;
+            };
+            Some(request)
+        };
+
+        let tab_id = self.active_sftp_tab_id.clone();
+        let mut running = transfer.clone();
+        running.status = TransferStatus::Running;
+        running.error = None;
+        self.sftp_state.upsert_transfer(running);
+        self.sync_active_sftp_tab_from_state();
+        let services = Arc::clone(&self.services);
+        self.services.rt.spawn(async move {
+            let mut retry_session = session.unwrap_or_default();
+            let mut temporary_session = None;
+            let mut progress_reported = false;
+            let result: Result<(), String> = async {
+                if let Some(request) = reconnect {
+                    retry_session = services
+                        .ssh
+                        .connect_transport_only(request, services.verifier())
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    temporary_session = Some(retry_session.clone());
+                    if services.ssh.session_peer(&retry_session).as_ref()
+                        != transfer.retry_peer.as_ref()
+                    {
+                        return Err("The SSH host key changed since this transfer started.".into());
+                    }
+                    services
+                        .sftp
+                        .attach_to_ssh(&services.ssh, &retry_session)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
+                services
+                    .sftp
+                    .retry_file(&retry_session, transfer.clone(), |progress| {
+                        progress_reported = true;
+                        let _ = services.ui_tx.send(UiEvent::SftpFileTransfer {
+                            tab_id: tab_id.clone(),
+                            session_id: retry_session.clone(),
+                            progress,
+                        });
+                    })
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok(())
+            }
+            .await;
+
+            if let Some(session_id) = temporary_session {
+                services.sftp.close(&session_id).await;
+                let _ = services.ssh.close_session(&session_id).await;
+            }
+            if let Err(error) = result
+                && !progress_reported
+            {
+                let mut failed = transfer;
+                failed.error = Some(error);
+                let _ = services.ui_tx.send(UiEvent::SftpFileTransfer {
+                    tab_id,
+                    session_id: retry_session,
+                    progress: failed,
+                });
+            }
+        });
+        cx.notify();
     }
 
     // -------------------------------------------------------------------------
@@ -4768,26 +5124,85 @@ impl StermAdminApp {
     }
 
     pub fn paste_into_terminal(&mut self, tab_id: &str, cx: &mut Context<Self>) {
-        let Some(tab) = self.terminal_tabs.iter_mut().find(|t| t.tab_id == tab_id) else {
-            return;
-        };
-        if !tab.connected {
+        if self.modal.is_some()
+            || !self
+                .terminal_tabs
+                .iter()
+                .any(|pane| pane.tab_id == tab_id && pane.connected && pane.session_id.is_some())
+        {
             return;
         }
-        let Some(session_id) = tab.session_id.clone() else {
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return;
         };
-        if let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) {
-            if text.is_empty() {
-                return;
-            }
-            tab.clear_selection();
-            tab.scroll_to_bottom();
-            let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
-            let _ = session_id;
-            self.write_bytes_to_target_panes(tab_id, normalized.into_bytes());
+        if text.is_empty() {
+            return;
+        }
+        let targets = self.terminal_paste_targets(tab_id);
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        if text.contains('\n')
+            && (self
+                .active_workspace_tab()
+                .is_some_and(|tab| tab.broadcast_input)
+                || targets.iter().any(|target| target.is_production))
+        {
+            self.open_modal(
+                ActiveModal::PastePreview {
+                    pane_id: tab_id.to_string(),
+                    text,
+                    targets,
+                },
+                cx,
+            );
+        } else {
+            self.send_terminal_paste(tab_id, &text, targets, cx);
+        }
+    }
+
+    pub fn confirm_terminal_paste(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.modal, Some(ActiveModal::PastePreview { .. })) {
+            return;
+        }
+        let Some(ActiveModal::PastePreview {
+            pane_id,
+            text,
+            targets,
+        }) = self.modal.take()
+        else {
+            return;
+        };
+        if !self
+            .active_workspace_tab()
+            .is_some_and(|tab| collect_pane_ids(&tab.root).contains(&pane_id))
+            || targets != self.terminal_paste_targets(&pane_id)
+        {
+            self.set_toast("Paste canceled because the target panes changed.", true);
             cx.notify();
+            return;
         }
+        self.send_terminal_paste(&pane_id, &text, targets, cx);
+    }
+
+    fn send_terminal_paste(
+        &mut self,
+        pane_id: &str,
+        text: &str,
+        targets: Vec<PasteTarget>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(pane) = self
+            .terminal_tabs
+            .iter_mut()
+            .find(|pane| pane.tab_id == pane_id)
+        {
+            pane.clear_selection();
+            pane.scroll_to_bottom();
+        }
+        let sessions = targets
+            .into_iter()
+            .map(|target| (target.is_local, target.session_id));
+        self.write_terminal_input(sessions, text.replace('\n', "\r").as_bytes());
+        cx.notify();
     }
 
     pub fn terminal_mouse_down(
@@ -5049,12 +5464,31 @@ impl StermAdminApp {
             }
         }
 
+        if matches!(
+            self.modal,
+            Some(ActiveModal::PastePreview { .. } | ActiveModal::SftpBookmarks { .. })
+        ) {
+            if self.settings.keybindings.matches(ShortcutAction::LockVault, ks) {
+                self.lock_vault(cx);
+            } else if ks.key == "tab" && !mod_key && !ks.modifiers.alt {
+                if ks.modifiers.shift {
+                    _window.focus_prev();
+                } else {
+                    _window.focus_next();
+                }
+                cx.stop_propagation();
+            } else if mod_key && ks.key == "enter" {
+                self.confirm_terminal_paste(cx);
+            }
+            return;
+        }
+
         if !self.vault_status.unlocked {
             return;
         }
 
         if self.settings.keybindings.matches(ShortcutAction::CommandPalette, ks) {
-            self.open_command_palette(cx);
+            self.open_command_palette(_window, cx);
         } else if self.settings.keybindings.matches(ShortcutAction::ShortcutsHelp, ks) {
             self.open_modal(ActiveModal::ShortcutsHelp, cx);
         } else if self.settings.keybindings.matches(ShortcutAction::OpenLocalShell, ks) {
@@ -5107,7 +5541,8 @@ impl StermAdminApp {
 
         // Global customizable shortcuts while terminal is focused
         if self.settings.keybindings.matches(ShortcutAction::CommandPalette, ks) {
-            self.open_command_palette(cx);
+            self.open_command_palette(_window, cx);
+            cx.stop_propagation();
             return;
         }
         if self.settings.keybindings.matches(ShortcutAction::ShortcutsHelp, ks) {
@@ -5575,6 +6010,7 @@ impl StermAdminApp {
                             let local_cwd = SftpManager::default_local_dir();
                             let _ = services.ui_tx.send(UiEvent::SftpConnected {
                                 session_id: session_id.clone(),
+                                host_id: Some(host.id),
                                 host_label: label,
                                 remote_cwd: remote_cwd.clone(),
                                 local_cwd,
@@ -5643,7 +6079,7 @@ impl StermAdminApp {
         self.page = AdminPage::Sftp;
         self.page_epoch = self.page_epoch.wrapping_add(1);
         self.sftp_state.connecting = true;
-        self.sftp_state.host_id = pane_host_id;
+        self.sftp_state.host_id = pane_host_id.clone();
         let target_sftp_tab = Some(self.active_sftp_tab_id.clone());
         self.sync_active_sftp_tab_from_state();
         self.refresh_local_dir(self.sftp_state.local_path.clone());
@@ -5655,6 +6091,7 @@ impl StermAdminApp {
                     let local_cwd = SftpManager::default_local_dir();
                     let _ = services.ui_tx.send(UiEvent::SftpConnected {
                         session_id: session_id.clone(),
+                        host_id: pane_host_id,
                         host_label,
                         remote_cwd: remote_cwd.clone(),
                         local_cwd,
@@ -5677,6 +6114,199 @@ impl StermAdminApp {
                 }
             }
         });
+        cx.notify();
+    }
+
+    pub fn bookmark_host(&self) -> Option<&str> {
+        let state = &self.sftp_state;
+        if state.is_left_remote() || state.connecting || state.session_id.is_none() {
+            return None;
+        }
+        state.connected_host_id.as_deref()
+    }
+
+    pub fn open_sftp_bookmarks(&mut self, cx: &mut Context<Self>) {
+        let Some(host_id) = self.bookmark_host().map(str::to_owned) else {
+            return;
+        };
+        let result = self
+            .services
+            .vault
+            .lock()
+            .map_err(|_| "Vault is unavailable.".to_string())
+            .and_then(|vault| {
+                vault
+                    .get_local_setting(&format!("sftp_bookmarks:{host_id}"))
+                    .map_err(|error| error.to_string())
+            });
+        match result {
+            Ok(bookmarks) => self.open_modal(
+                ActiveModal::SftpBookmarks {
+                    host_id,
+                    bookmarks: bookmarks.unwrap_or_default(),
+                    opening: false,
+                },
+                cx,
+            ),
+            Err(error) => {
+                self.set_toast(format!("Could not load SFTP bookmarks. {error}"), true);
+                cx.notify();
+            }
+        }
+    }
+
+    pub fn current_sftp_bookmark(&self) -> Option<SftpBookmark> {
+        self.bookmark_host()?;
+        if self.sftp_state.loading_local || self.sftp_state.loading_remote {
+            return None;
+        }
+        Some(SftpBookmark {
+            local_path: self.sftp_state.local_path.clone(),
+            remote_path: self.sftp_state.remote_path.clone(),
+        })
+    }
+
+    pub fn save_current_sftp_bookmark(&mut self, cx: &mut Context<Self>) {
+        if let Some(bookmark) = self.current_sftp_bookmark() {
+            self.update_sftp_bookmarks(bookmark, true, cx);
+        }
+    }
+
+    pub fn update_sftp_bookmarks(
+        &mut self,
+        bookmark: SftpBookmark,
+        save: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ActiveModal::SftpBookmarks {
+            host_id,
+            opening: false,
+            ..
+        }) = &self.modal
+        else {
+            return;
+        };
+        if self.bookmark_host() != Some(host_id.as_str()) {
+            return;
+        }
+        let key = format!("sftp_bookmarks:{host_id}");
+        let result = self
+            .services
+            .vault
+            .lock()
+            .map_err(|_| "Vault is unavailable.".to_string())
+            .and_then(|vault| {
+                let mut bookmarks: Vec<SftpBookmark> = vault
+                    .get_local_setting(&key)
+                    .map_err(|error| error.to_string())?
+                    .unwrap_or_default();
+                if save {
+                    if !bookmarks.contains(&bookmark) {
+                        bookmarks.push(bookmark);
+                    }
+                } else {
+                    bookmarks.retain(|entry| entry != &bookmark);
+                }
+                vault
+                    .set_local_setting(&key, &bookmarks)
+                    .map_err(|error| error.to_string())?;
+                Ok(bookmarks)
+            });
+        match result {
+            Ok(updated) => {
+                if let Some(ActiveModal::SftpBookmarks { bookmarks, .. }) = &mut self.modal {
+                    *bookmarks = updated;
+                }
+            }
+            Err(error) => self.set_toast(format!("Could not update SFTP bookmarks. {error}"), true),
+        }
+        cx.notify();
+    }
+
+    pub fn open_sftp_bookmark(&mut self, bookmark: SftpBookmark, cx: &mut Context<Self>) {
+        let Some(ActiveModal::SftpBookmarks {
+            host_id,
+            opening: false,
+            ..
+        }) = &self.modal
+        else {
+            return;
+        };
+        if self.bookmark_host() != Some(host_id.as_str()) || self.current_sftp_bookmark().is_none()
+        {
+            return;
+        }
+        let Some(session_id) = self.sftp_state.session_id.clone() else {
+            return;
+        };
+        let tab_id = self.active_sftp_tab_id.clone();
+        let epoch = self.modal_epoch;
+        if let Some(ActiveModal::SftpBookmarks { opening, .. }) = &mut self.modal {
+            *opening = true;
+        }
+        let services = Arc::clone(&self.services);
+        let target_session = session_id.clone();
+        let task = self.services.rt.spawn(async move {
+            tokio::try_join!(
+                SftpManager::list_local_dir(&bookmark.local_path),
+                services
+                    .sftp
+                    .list_remote_dir(&target_session, &bookmark.remote_path)
+            )
+        });
+        cx.spawn(
+            async move |this: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let result = task
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result.map_err(|error| error.to_string()));
+                let _ = this.update(cx, |app, cx| {
+                    if app.modal_epoch != epoch
+                        || !matches!(
+                            app.modal,
+                            Some(ActiveModal::SftpBookmarks { opening: true, .. })
+                        )
+                    {
+                        return;
+                    }
+                    app.modal = None;
+                    if app.active_sftp_tab_id != tab_id
+                        || app.sftp_state.session_id.as_deref() != Some(session_id.as_str())
+                        || app.current_sftp_bookmark().is_none()
+                    {
+                        app.set_toast(
+                            "The SFTP connection changed while opening the bookmark.",
+                            true,
+                        );
+                    } else {
+                        match result {
+                            Ok(((local_path, local_entries), (remote_path, remote_entries))) => {
+                                let state = &mut app.sftp_state;
+                                state.local_path = local_path.clone();
+                                state.local_entries = local_entries;
+                                state.remote_path = remote_path.clone();
+                                state.remote_entries = remote_entries;
+                                state.selected_local = None;
+                                state.selected_remote = None;
+                                state.selected_local_paths.clear();
+                                state.selected_remote_paths.clear();
+                                state.reset_local_scroll();
+                                state.reset_remote_scroll();
+                                app.sftp_local_path_input
+                                    .update(cx, |f, cx| f.set_value(local_path, cx));
+                                app.sftp_remote_path_input
+                                    .update(cx, |f, cx| f.set_value(remote_path, cx));
+                                app.sync_active_sftp_tab_from_state();
+                            }
+                            Err(error) => app
+                                .set_toast(format!("Could not open SFTP bookmark. {error}"), true),
+                        }
+                    }
+                    cx.notify();
+                });
+            },
+        )
+        .detach();
         cx.notify();
     }
 
@@ -5767,51 +6397,13 @@ impl StermAdminApp {
         file_name: String,
         cx: &mut Context<Self>,
     ) {
-        let Some(session_id) = self.sftp_state.session_id.clone() else {
-            self.set_toast("Connect an SFTP remote host before uploading.", true);
-            cx.notify();
-            return;
-        };
-        let remote_dest = join_remote_path(&self.sftp_state.remote_path, &file_name);
-        let remote_dir = self.sftp_state.remote_path.clone();
-        let services = Arc::clone(&self.services);
-
-        self.services.rt.spawn(async move {
-            let tx = services.ui_tx.clone();
-            let res = services
-                .sftp
-                .upload_file(
-                    &session_id,
-                    &PathBuf::from(&local_path),
-                    &remote_dest,
-                    move |p| {
-                        let _ = tx.send(UiEvent::SftpTransfer(p));
-                    },
-                )
-                .await;
-            match res {
-                Ok(_) => {
-                    let _ = services
-                        .ui_tx
-                        .send(UiEvent::SftpNotice(format!("Uploaded {file_name} to Remote.")));
-                    if let Ok((resolved, entries)) =
-                        services.sftp.list_remote_dir(&session_id, &remote_dir).await
-                    {
-                        let _ = services.ui_tx.send(UiEvent::SftpRemoteListed {
-                            session_id,
-                            path: resolved,
-                            entries,
-                        });
-                    }
-                }
-                Err(e) => {
-                    let _ = services
-                        .ui_tx
-                        .send(UiEvent::SftpError(format!("Upload failed: {e}")));
-                }
-            }
-        });
-        cx.notify();
+        let remote_path = join_remote_path(&self.sftp_state.remote_path, &file_name);
+        self.start_sftp_file_transfer(
+            TransferDirection::Upload,
+            PathBuf::from(local_path),
+            remote_path,
+            cx,
+        );
     }
 
     pub fn download_remote_file(
@@ -5820,40 +6412,54 @@ impl StermAdminApp {
         file_name: String,
         cx: &mut Context<Self>,
     ) {
+        let local_path = PathBuf::from(&self.sftp_state.local_path).join(file_name);
+        self.start_sftp_file_transfer(TransferDirection::Download, local_path, remote_path, cx);
+    }
+
+    fn start_sftp_file_transfer(
+        &mut self,
+        direction: TransferDirection,
+        local_path: PathBuf,
+        remote_path: String,
+        cx: &mut Context<Self>,
+    ) {
         let Some(session_id) = self.sftp_state.session_id.clone() else {
             self.set_toast("Connect an SFTP remote host first.", true);
             cx.notify();
             return;
         };
-        let local_dir = self.sftp_state.local_path.clone();
-        let local_dest = PathBuf::from(&local_dir).join(&file_name);
+        let tab_id = self.active_sftp_tab_id.clone();
         let services = Arc::clone(&self.services);
-
         self.services.rt.spawn(async move {
-            let tx = services.ui_tx.clone();
-            let res = services
-                .sftp
-                .download_file(&session_id, &remote_path, &local_dest, move |p| {
-                    let _ = tx.send(UiEvent::SftpTransfer(p));
-                })
-                .await;
-            match res {
-                Ok(_) => {
-                    let _ = services.ui_tx.send(UiEvent::SftpNotice(format!(
-                        "Downloaded {file_name} to Local."
-                    )));
-                    if let Ok((resolved, entries)) = SftpManager::list_local_dir(&local_dir).await {
-                        let _ = services.ui_tx.send(UiEvent::SftpLocalListed {
-                            path: resolved,
-                            entries,
-                        });
-                    }
+            let mut reported = false;
+            let on_progress = |progress| {
+                reported = true;
+                let _ = services.ui_tx.send(UiEvent::SftpFileTransfer {
+                    tab_id: tab_id.clone(),
+                    session_id: session_id.clone(),
+                    progress,
+                });
+            };
+            let result = match direction {
+                TransferDirection::Upload => {
+                    services
+                        .sftp
+                        .upload_file(&session_id, &local_path, &remote_path, on_progress)
+                        .await
                 }
-                Err(e) => {
-                    let _ = services
-                        .ui_tx
-                        .send(UiEvent::SftpError(format!("Download failed: {e}")));
+                TransferDirection::Download => {
+                    services
+                        .sftp
+                        .download_file(&session_id, &remote_path, &local_path, on_progress)
+                        .await
                 }
+            };
+            if let Err(error) = result
+                && !reported
+            {
+                let _ = services.ui_tx.send(UiEvent::SftpError(format!(
+                    "File transfer could not start. {error}"
+                )));
             }
         });
         cx.notify();
@@ -6731,6 +7337,7 @@ impl StermAdminApp {
             }
             UiEvent::SftpConnected {
                 session_id,
+                host_id,
                 host_label,
                 remote_cwd,
                 local_cwd,
@@ -6742,6 +7349,7 @@ impl StermAdminApp {
                 if is_active_target {
                     self.sftp_state.connecting = false;
                     self.sftp_state.session_id = Some(session_id);
+                    self.sftp_state.connected_host_id = host_id;
                     self.sftp_state.host_label = Some(host_label.clone());
                     self.sftp_state.remote_path = remote_cwd.clone();
                     self.sftp_remote_path_input
@@ -6759,6 +7367,7 @@ impl StermAdminApp {
                     let tab = &mut self.sftp_tabs[ix];
                     tab.state.connecting = false;
                     tab.state.session_id = Some(session_id);
+                    tab.state.connected_host_id = host_id;
                     tab.state.host_label = Some(host_label.clone());
                     tab.state.remote_path = remote_cwd;
                     tab.state.selected_remote = None;
@@ -6809,6 +7418,49 @@ impl StermAdminApp {
             UiEvent::SftpTransfer(progress) => {
                 self.sftp_state.upsert_transfer(progress);
                 self.sync_active_sftp_tab_from_state();
+            }
+            UiEvent::SftpFileTransfer {
+                tab_id,
+                session_id,
+                progress,
+            } => {
+                if self.active_sftp_tab_id == tab_id {
+                    match &progress.status {
+                        TransferStatus::Completed => {
+                            match progress.direction {
+                                TransferDirection::Upload
+                                    if self.sftp_state.session_id.as_deref()
+                                        == Some(&session_id)
+                                        && self.sftp_state.remote_path
+                                            == parent_remote_path(&progress.remote_path) =>
+                                {
+                                    self.refresh_remote_dir(self.sftp_state.remote_path.clone());
+                                }
+                                TransferDirection::Download
+                                    if !self.sftp_state.is_left_remote()
+                                        && std::path::Path::new(&progress.local_path).parent()
+                                            == Some(std::path::Path::new(
+                                                &self.sftp_state.local_path,
+                                            )) =>
+                                {
+                                    self.refresh_local_dir(self.sftp_state.local_path.clone());
+                                }
+                                _ => {}
+                            }
+                            self.set_toast(format!("Transferred {}.", progress.file_name), false);
+                        }
+                        TransferStatus::Failed => {
+                            if let Some(error) = &progress.error {
+                                self.set_toast(error.clone(), true);
+                            }
+                        }
+                        _ => {}
+                    }
+                    self.sftp_state.upsert_transfer(progress);
+                    self.sync_active_sftp_tab_from_state();
+                } else if let Some(tab) = self.sftp_tabs.iter_mut().find(|tab| tab.id == tab_id) {
+                    tab.state.upsert_transfer(progress);
+                }
             }
             UiEvent::SftpRemoteTextLoaded {
                 session_id,
@@ -7274,8 +7926,8 @@ impl Render for StermAdminApp {
                                     t,
                                 ))
                             })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.open_command_palette(cx);
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_command_palette(window, cx);
                             }))
                             .child(
                                 div()

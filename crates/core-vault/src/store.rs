@@ -3,7 +3,7 @@ use std::path::Path;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use chrono::Utc;
 use core_crypto::{
-    cipher::{build_record_aad, decrypt_aead, encrypt_aead, unwrap_dek, wrap_dek},
+    cipher::{build_record_aad, decrypt_aead, encrypt_aead, unwrap_dek, wrap_dek, NONCE_LEN},
     kdf::{derive_keys, generate_salt, KdfParams, SecretKey},
     keychain,
 };
@@ -193,6 +193,28 @@ impl VaultStore {
 
     pub fn set_meta_string(&self, key: &str, value: &str) -> VaultResult<()> {
         self.set_meta(key, value.as_bytes())
+    }
+
+    /// Reads encrypted settings specific to this installation.
+    pub fn get_local_setting<T: DeserializeOwned>(&self, key: &str) -> VaultResult<Option<T>> {
+        let dek = self.require_dek()?;
+        let storage_key = format!("local_setting:{key}");
+        let Some(data) = self.get_meta(&storage_key)? else {
+            return Ok(None);
+        };
+        let (nonce, ciphertext) = data.split_at(data.len().min(NONCE_LEN));
+        let plaintext = decrypt_aead(dek, nonce, ciphertext, storage_key.as_bytes())?;
+        Ok(Some(serde_json::from_slice(&plaintext)?))
+    }
+
+    /// Stores encrypted settings outside the synced vault records.
+    pub fn set_local_setting<T: Serialize>(&self, key: &str, value: &T) -> VaultResult<()> {
+        let dek = self.require_dek()?;
+        let storage_key = format!("local_setting:{key}");
+        let blob = encrypt_aead(dek, &serde_json::to_vec(value)?, storage_key.as_bytes())?;
+        let mut data = blob.nonce.to_vec();
+        data.extend_from_slice(&blob.ciphertext);
+        self.set_meta(&storage_key, &data)
     }
 
     /// Re-wraps the DEK with a newly derived vault key (e.g. after a server-confirmed password change).
@@ -777,6 +799,34 @@ impl VaultStore {
 mod tests {
     use super::*;
     use crate::models::CredentialKind;
+
+    #[test]
+    fn local_settings_are_encrypted_and_stay_out_of_sync() {
+        let mut store = VaultStore::open_in_memory().unwrap();
+        let password = Uuid::new_v4().to_string();
+        store.initialize_vault(&password, false).unwrap();
+
+        let key = "sftp_bookmarks:host";
+        let paths = ["/local/project", "/remote/project"];
+        assert_eq!(store.get_local_setting::<Vec<String>>(key).unwrap(), None);
+        store.set_local_setting(key, &paths).unwrap();
+        let raw = store
+            .get_meta("local_setting:sftp_bookmarks:host")
+            .unwrap()
+            .unwrap();
+        assert!(!raw
+            .windows(paths[1].len())
+            .any(|part| part == paths[1].as_bytes()));
+        assert!(store.list_dirty_envelopes().unwrap().is_empty());
+
+        store.lock();
+        assert!(matches!(
+            store.get_local_setting::<Vec<String>>(key),
+            Err(VaultError::Locked)
+        ));
+        store.unlock_with_password(&password, None).unwrap();
+        assert_eq!(store.get_local_setting::<Vec<String>>(key).unwrap().unwrap(), paths);
+    }
 
     #[test]
     fn vault_lifecycle_crud_and_rekey() {

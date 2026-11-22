@@ -2,7 +2,7 @@ use core_ssh::types::HostKeyStatus;
 use core_vault::models::{CredentialKind, HostAuthMode, PortForwardKind};
 use gpui::{div, prelude::*, px, rgb, AnyElement, Context, Entity, FontWeight, MouseButton};
 
-use crate::app::{ActiveModal, ConfirmAction, StermAdminApp};
+use crate::app::{ActiveModal, ConfirmAction, PasteTarget, SftpBookmark, StermAdminApp};
 use crate::keybindings::ShortcutAction;
 use crate::local_shell::LocalShellManager;
 use crate::motion::animate_modal_enter;
@@ -24,7 +24,20 @@ impl StermAdminApp {
 
         let card: AnyElement = match modal {
             ActiveModal::CommandPalette => self.render_command_palette_modal(t, cx).into_any_element(),
+            ActiveModal::SaveNamedWorkspace { error, .. } => self
+                .render_save_workspace_modal(t, error, cx)
+                .into_any_element(),
             ActiveModal::QuickConnect => self.render_quick_connect_modal(t, cx).into_any_element(),
+            ActiveModal::PastePreview { text, targets, .. } => self
+                .render_paste_preview(t, text, targets, cx)
+                .into_any_element(),
+            ActiveModal::SftpBookmarks {
+                host_id,
+                bookmarks,
+                opening,
+            } => self
+                .render_sftp_bookmarks(t, &host_id, bookmarks, opening, cx)
+                .into_any_element(),
             ActiveModal::HostEditor { editing_id } => {
                 self.render_host_editor_modal(t, editing_id, cx).into_any_element()
             }
@@ -119,8 +132,323 @@ impl StermAdminApp {
     }
 
     // -------------------------------------------------------------------------
+    // Paste Preview and SFTP Bookmarks
+    // -------------------------------------------------------------------------
+    fn render_paste_preview(
+        &self,
+        t: &ThemePalette,
+        text: String,
+        targets: Vec<PasteTarget>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let mut preview = String::with_capacity(text.len());
+        for ch in text.chars() {
+            if ch == '\n'
+                || (!ch.is_control()
+                    && !matches!(ch, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'))
+            {
+                preview.push(ch);
+            } else {
+                preview.extend(ch.escape_debug());
+            }
+        }
+        let description = format!(
+            "Review the clipboard before sending it to {} {}. Each line break sends Enter.",
+            targets.len(),
+            if targets.len() == 1 { "pane" } else { "panes" },
+        );
+        div()
+            .tab_group()
+            .w(px(560.0))
+            .max_w_full()
+            .rounded_2xl()
+            .bg(t.bg_card)
+            .border_1()
+            .border_color(t.border_strong)
+            .shadow_2xl()
+            .p_5()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(self.modal_header(t, "Preview Terminal Paste", &description, cx))
+            .child(
+                div()
+                    .id("paste-preview-targets")
+                    .max_h(px(100.0))
+                    .overflow_y_scroll()
+                    .children(targets.into_iter().enumerate().map(|(index, target)| {
+                        div()
+                            .text_xs()
+                            .text_color(if target.is_production {
+                                t.danger
+                            } else {
+                                t.text_secondary
+                            })
+                            .child(format!(
+                                "{}{}. {}",
+                                if target.is_production { "PROD · " } else { "" },
+                                index + 1,
+                                target.label
+                            ))
+                    })),
+            )
+            .child(
+                div()
+                    .id("paste-preview-text")
+                    .max_h(px(200.0))
+                    .overflow_y_scroll()
+                    .p_2()
+                    .rounded_lg()
+                    .bg(t.bg_subtle)
+                    .text_color(t.text_primary)
+                    .font_family("monospace")
+                    .text_sm()
+                    .child(preview),
+            )
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(self.cancel_modal_btn(t, cx))
+                    .child(
+                        div()
+                            .id("confirm-terminal-paste")
+                            .tab_index(0)
+                            .px_4()
+                            .py_2()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(t.accent_soft)
+                            .bg(t.accent_soft)
+                            .text_color(t.accent)
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .cursor_pointer()
+                            .hover(|s| s.opacity(0.85))
+                            .focus(|s| s.border_color(t.accent))
+                            .tooltip(StermTooltip::with_shortcut(
+                                "Paste",
+                                "Ctrl / Cmd + Enter",
+                                *t,
+                            ))
+                            .on_click(cx.listener(|this, _, _, cx| this.confirm_terminal_paste(cx)))
+                            .child("Paste"),
+                    ),
+            )
+    }
+
+    fn render_sftp_bookmarks(
+        &self,
+        t: &ThemePalette,
+        host_id: &str,
+        bookmarks: Vec<SftpBookmark>,
+        opening: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let current = self
+            .current_sftp_bookmark()
+            .filter(|_| self.bookmark_host() == Some(host_id));
+        let ready = !opening
+            && current
+                .as_ref()
+                .is_some_and(|pair| !bookmarks.contains(pair));
+        let title = self
+            .sftp_state
+            .host_label
+            .as_deref()
+            .unwrap_or("Current Host");
+        div()
+            .tab_group()
+            .w(px(560.0))
+            .max_w_full()
+            .rounded_2xl()
+            .bg(t.bg_card)
+            .border_1()
+            .border_color(t.border_strong)
+            .shadow_2xl()
+            .p_5()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(self.modal_header(t, "SFTP Bookmarks", title, cx))
+            .when(bookmarks.is_empty(), |card| {
+                card.child(
+                    div()
+                        .text_xs()
+                        .text_color(t.text_secondary)
+                        .child("Save the current local and remote folders to open them together."),
+                )
+            })
+            .child(
+                div()
+                    .id("sftp-bookmark-list")
+                    .max_h(px(270.0))
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .children(bookmarks.into_iter().enumerate().map(|(index, bookmark)| {
+                        let to_open = bookmark.clone();
+                        div()
+                            .flex()
+                            .flex_shrink_0()
+                            .items_center()
+                            .gap_2()
+                            .p_2()
+                            .rounded_lg()
+                            .bg(t.bg_subtle)
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .text_xs()
+                                    .text_color(t.text_primary)
+                                    .child(div().child(format!("Local · {}", bookmark.local_path)))
+                                    .child(
+                                        div().child(format!("Remote · {}", bookmark.remote_path)),
+                                    ),
+                            )
+                            .when(!opening && current.is_some(), |row| {
+                                row.child(
+                                    div()
+                                        .id(("open-sftp-bookmark", index))
+                                        .tab_index(0)
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(t.bg_subtle)
+                                        .text_xs()
+                                        .text_color(t.accent)
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(t.accent_soft))
+                                        .focus(|s| s.border_color(t.accent))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.open_sftp_bookmark(to_open.clone(), cx)
+                                        }))
+                                        .child("Open"),
+                                )
+                                .child(
+                                    div()
+                                        .id(("remove-sftp-bookmark", index))
+                                        .tab_index(0)
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(t.bg_subtle)
+                                        .text_xs()
+                                        .text_color(t.text_secondary)
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(t.danger_soft).text_color(t.danger))
+                                        .focus(|s| s.border_color(t.accent))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.update_sftp_bookmarks(bookmark.clone(), false, cx)
+                                        }))
+                                        .child("Remove"),
+                                )
+                            })
+                    })),
+            )
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .items_center()
+                    .gap_2()
+                    .when(opening, |bar| {
+                        bar.child(
+                            div()
+                                .text_xs()
+                                .text_color(t.text_secondary)
+                                .child("Opening folders…"),
+                        )
+                    })
+                    .child(self.cancel_modal_btn(t, cx))
+                    .when(ready, |bar| {
+                        bar.child(
+                            div()
+                                .id("save-sftp-bookmark")
+                                .tab_index(0)
+                                .px_4()
+                                .py_2()
+                                .rounded_lg()
+                                .border_1()
+                                .border_color(t.accent_soft)
+                                .bg(t.accent_soft)
+                                .text_color(t.accent)
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .cursor_pointer()
+                                .hover(|s| s.opacity(0.85))
+                                .focus(|s| s.border_color(t.accent))
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.save_current_sftp_bookmark(cx)
+                                    }),
+                                )
+                                .child("Save Current Folders"),
+                        )
+                    }),
+            )
+    }
+
+    // -------------------------------------------------------------------------
     // 1. Command Palette (Ctrl/Cmd+K)
     // -------------------------------------------------------------------------
+    fn render_save_workspace_modal(
+        &self,
+        t: &ThemePalette,
+        error: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .w(px(430.0))
+            .max_w_full()
+            .rounded_2xl()
+            .bg(t.bg_card)
+            .border_1()
+            .border_color(t.border_strong)
+            .shadow_2xl()
+            .p_5()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(self.modal_header(
+                t,
+                "Save Workspace",
+                "Save the pane layout of this tab on this device.",
+                cx,
+            ))
+            .child(self.named_workspace_name.clone())
+            .when_some(error, |card, error| {
+                card.child(div().text_xs().text_color(t.danger).child(error))
+            })
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(self.cancel_modal_btn(t, cx))
+                    .child(
+                        div()
+                            .id("save-named-workspace")
+                            .px_4()
+                            .py_2()
+                            .rounded_lg()
+                            .bg(t.accent_soft)
+                            .text_color(t.accent)
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .cursor_pointer()
+                            .hover(|s| s.opacity(0.85))
+                            .on_click(cx.listener(|this, _, _, cx| this.save_named_workspace(cx)))
+                            .child("Save Workspace"),
+                    ),
+            )
+    }
+
     fn render_command_palette_modal(
         &self,
         t: &ThemePalette,
@@ -129,6 +457,11 @@ impl StermAdminApp {
         let query = self.palette_query.read(cx).value().trim().to_string();
         let q = query.to_lowercase();
         let quick_target = Self::parse_quick_target(&query);
+        let named_workspaces = self
+            .named_workspaces
+            .iter()
+            .filter(|workspace| workspace.title.to_lowercase().contains(&q));
+        let can_save = self.active_workspace_tab().is_some() && "save workspace".contains(&q);
 
         let matched_tabs: Vec<_> = self
             .workspace_tabs
@@ -223,7 +556,7 @@ impl StermAdminApp {
             .child(self.modal_header(
                 t,
                 "Command Omnibar & Quick Connect",
-                "Jump to hosts, open tabs, tunnels, snippets, actions, or type user@host:port.",
+                "Find hosts, workspaces, tunnels, snippets, and actions, or type user@host:port.",
                 cx,
             ))
             .child(self.palette_query.clone())
@@ -344,6 +677,69 @@ impl StermAdminApp {
                     .flex()
                     .flex_col()
                     .gap_2()
+                    .when(can_save, |el| {
+                        el.child(
+                            div()
+                                .id("palette-save-workspace")
+                                .px_3()
+                                .py_2()
+                                .rounded_lg()
+                                .bg(t.accent_soft)
+                                .text_xs()
+                                .text_color(t.accent)
+                                .cursor_pointer()
+                                .hover(|s| s.bg(t.bg_hover))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.prompt_save_named_workspace(window, cx);
+                                }))
+                                .child("Save Workspace…"),
+                        )
+                    })
+                    .children(named_workspaces.enumerate().map(|(index, workspace)| {
+                        let layout = workspace.clone();
+                        let name = workspace.title.clone();
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .px_3()
+                            .py_1p5()
+                            .rounded_lg()
+                            .bg(t.bg_subtle)
+                            .child(
+                                div()
+                                    .id(("palette-open-named-workspace", index))
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(t.accent)
+                                    .cursor_pointer()
+                                    .hover(|s| s.underline())
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.open_named_workspace(layout.clone(), cx);
+                                    }))
+                                    .child(format!("Open Workspace · {}", workspace.title)),
+                            )
+                            .child(
+                                div()
+                                    .id(("palette-remove-named-workspace", index))
+                                    .text_xs()
+                                    .text_color(t.text_muted)
+                                    .cursor_pointer()
+                                    .hover(|s| s.text_color(t.danger))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.request_confirm(
+                                            ConfirmAction::DeleteNamedWorkspace {
+                                                name: name.clone(),
+                                            },
+                                            cx,
+                                        );
+                                    }))
+                                    .child("Remove"),
+                            )
+                    }))
                     .when(!matched_tabs.is_empty(), |el| {
                         el.child(
                             div()
@@ -2840,6 +3236,11 @@ impl StermAdminApp {
                 "Delete Port Forward Tunnel?",
                 format!("Stop (if running) and permanently remove tunnel '{label}' from your vault?"),
                 "Delete Tunnel",
+            ),
+            ConfirmAction::DeleteNamedWorkspace { name } => (
+                "Remove Saved Workspace",
+                format!("Remove the saved layout “{name}”?"),
+                "Remove Workspace",
             ),
             ConfirmAction::DeleteRemoteFile { name, is_dir, .. } => (
                 if *is_dir {
