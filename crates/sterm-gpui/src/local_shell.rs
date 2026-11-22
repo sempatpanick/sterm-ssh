@@ -120,6 +120,7 @@ impl LocalShellManager {
     pub fn spawn<F>(
         &self,
         spec: &LocalShellSpec,
+        initial_cwd: Option<std::path::PathBuf>,
         cols: u16,
         rows: u16,
         mut on_event: F,
@@ -141,8 +142,8 @@ impl LocalShellManager {
         for arg in &spec.args {
             cmd.arg(arg);
         }
-        if let Some(home) = dirs::home_dir() {
-            cmd.cwd(home);
+        if let Some(dir) = initial_cwd.filter(|p| p.is_dir()).or_else(dirs::home_dir) {
+            cmd.cwd(dir);
         }
         cmd.env("TERM", "xterm-256color");
 

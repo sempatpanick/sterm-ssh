@@ -91,6 +91,114 @@ impl Render for DragFilePill {
 }
 
 #[derive(Debug, Clone)]
+pub struct DraggedWorkspaceTab {
+    pub tab_id: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct DraggedSftpTab {
+    pub sftp_tab_id: String,
+    pub label: String,
+}
+
+pub struct DragTabPill {
+    pub label: String,
+    pub position: Point<Pixels>,
+    pub theme_mode: ThemeMode,
+}
+
+impl DragTabPill {
+    pub fn new(label: impl Into<String>, position: Point<Pixels>, theme_mode: ThemeMode) -> Self {
+        Self {
+            label: label.into(),
+            position,
+            theme_mode,
+        }
+    }
+}
+
+impl Render for DragTabPill {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let t = ThemePalette::for_mode(self.theme_mode);
+        let width = px(180.0);
+        let height = px(32.0);
+        div()
+            .pl(self.position.x - width.half())
+            .pt(self.position.y - height.half())
+            .child(
+                div()
+                    .w(width)
+                    .h(height)
+                    .px_3()
+                    .rounded_lg()
+                    .bg(t.island_bg)
+                    .border_1()
+                    .border_color(t.accent)
+                    .shadow_lg()
+                    .flex()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(t.island_fg)
+                            .truncate()
+                            .child(self.label.clone()),
+                    ),
+            )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SftpTabSnapshot {
+    pub id: String,
+    pub label: String,
+    pub state: SftpWorkspaceState,
+}
+
+pub fn reorder_vec_by_id<T>(
+    items: &mut Vec<T>,
+    dragged_id: &str,
+    target_id: &str,
+    id_of: impl Fn(&T) -> &str,
+) -> bool {
+    if dragged_id == target_id {
+        return false;
+    }
+    let Some(from_ix) = items.iter().position(|item| id_of(item) == dragged_id) else {
+        return false;
+    };
+    let Some(to_ix) = items.iter().position(|item| id_of(item) == target_id) else {
+        return false;
+    };
+    let item = items.remove(from_ix);
+    items.insert(to_ix, item);
+    true
+}
+
+#[cfg(test)]
+mod tab_reorder_tests {
+    use super::reorder_vec_by_id;
+
+    #[test]
+    fn reorder_vec_by_id_moves_tabs_cleanly() {
+        let mut ids = vec!["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string()];
+
+        assert!(reorder_vec_by_id(&mut ids, "a", "c", String::as_str));
+        assert_eq!(ids, vec!["b", "c", "a", "d"]);
+
+        assert!(reorder_vec_by_id(&mut ids, "d", "b", String::as_str));
+        assert_eq!(ids, vec!["d", "b", "c", "a"]);
+
+        assert!(!reorder_vec_by_id(&mut ids, "b", "b", String::as_str));
+        assert!(!reorder_vec_by_id(&mut ids, "missing", "b", String::as_str));
+        assert!(!reorder_vec_by_id(&mut ids, "b", "missing", String::as_str));
+        assert_eq!(ids, vec!["d", "b", "c", "a"]);
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct SftpWorkspaceState {
     pub session_id: Option<String>,
     pub host_id: Option<String>,

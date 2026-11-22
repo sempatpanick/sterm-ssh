@@ -4,7 +4,7 @@ use gpui::{
     div, ease_out_quint, prelude::*, px, rgb, Animation, AnimationExt as _, Context, FontWeight,
 };
 
-use crate::app::{ConfirmAction, SettingsTab, StermAdminApp};
+use crate::app::{ActiveModal, ConfirmAction, SettingsTab, StermAdminApp};
 use crate::icons::{icon_svg, Icon};
 use crate::motion::loading_dots;
 use crate::theme::{
@@ -710,7 +710,63 @@ impl StermAdminApp {
                             this.settings.auto_reconnect = !this.settings.auto_reconnect;
                             this.save_settings(cx);
                         }),
-                    )),
+                    ))
+                    .child(self.settings_toggle_row(
+                        t,
+                        "set-restore-sessions-toggle",
+                        "Restore Open Sessions on Relaunch",
+                        "Reopen previous workspace tabs, split layouts, and local shell directories after vault unlock",
+                        self.settings.restore_sessions,
+                        cx.listener(|this, _, _, cx| {
+                            this.settings.restore_sessions = !this.settings.restore_sessions;
+                            this.save_settings(cx);
+                        }),
+                    ))
+                    .child(
+                        div()
+                            .pt_1()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(t.text_primary)
+                                            .child("Keyboard Shortcuts & Keybindings"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(11.0))
+                                            .text_color(t.text_muted)
+                                            .child("Customize global and terminal shortcuts interactively"),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("set-open-shortcuts-btn")
+                                    .px_3()
+                                    .py_1p5()
+                                    .rounded_lg()
+                                    .border_1()
+                                    .border_color(t.border_strong)
+                                    .bg(t.bg_subtle)
+                                    .text_xs()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(t.text_primary)
+                                    .cursor_pointer()
+                                    .hover(|s| s.border_color(t.accent).text_color(t.accent))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.open_modal(ActiveModal::ShortcutsHelp, cx);
+                                    }))
+                                    .child("Customize Keyboard Shortcuts..."),
+                            ),
+                    ),
             )
             // Right Card: Live Terminal Preview
             .child(
@@ -1413,6 +1469,17 @@ impl StermAdminApp {
                                         return;
                                     }
                                     this.settings.biometric_unlock = !this.settings.biometric_unlock;
+                                    this.save_settings(cx);
+                                }),
+                            ))
+                            .child(self.settings_toggle_row(
+                                t,
+                                "set-lock-on-sleep-toggle",
+                                "Lock Vault on System Sleep / Wake",
+                                "Automatically lock the encrypted vault when the OS resumes from sleep or hibernation",
+                                self.settings.lock_on_sleep,
+                                cx.listener(|this, _, _, cx| {
+                                    this.settings.lock_on_sleep = !this.settings.lock_on_sleep;
                                     this.save_settings(cx);
                                 }),
                             ))

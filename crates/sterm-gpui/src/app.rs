@@ -36,7 +36,8 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::backend::{
-    build_connect_request_for_host, build_ssh_copy_id_command, build_validated_credential,
+    awake_monotonic_duration, build_connect_request_for_host, build_remote_cd_command,
+    build_ssh_copy_id_command, build_validated_credential, detect_system_sleep_gap,
     is_ssh_auth_error, open_file_in_external_editor, run_sync_change_password,
     run_sync_delete_account, run_sync_login, run_sync_now, run_sync_register, verify_os_biometric,
     BackendServices, PublicSyncStatus, UiEvent,
@@ -46,11 +47,13 @@ use crate::command_suggestions::{
     should_record_command, SuggestedCommand, SuggestionSource,
 };
 use crate::icons::{icon_svg, Icon};
+use crate::keybindings::{KeyBinding, ShortcutAction};
 use crate::local_shell::{LocalShellManager, LocalShellSpec};
 use crate::motion::{animate_page_enter, indeterminate_bar, loading_dots, pulsing_dot};
 use crate::sftp::{
-    direction_arrow, join_remote_path, parent_local_path, parent_remote_path, resolve_local_input,
-    resolve_remote_input, transfer_percent, DraggedSftpFile, SftpPaneSide, SftpWorkspaceState,
+    direction_arrow, join_remote_path, parent_local_path, parent_remote_path, reorder_vec_by_id,
+    resolve_local_input, resolve_remote_input, transfer_percent, DragTabPill, DraggedSftpFile,
+    DraggedWorkspaceTab, SftpPaneSide, SftpTabSnapshot, SftpWorkspaceState,
 };
 use crate::split_tree::{
     close_pane as tree_close_pane, collect_pane_ids, create_leaf, split_pane as tree_split_pane,
@@ -103,6 +106,159 @@ pub struct WorkspaceTab {
     pub root: SplitNode,
     pub active_pane_id: String,
     pub broadcast_input: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum SavedPaneNode {
+    Leaf {
+        host_id: Option<String>,
+        is_local: bool,
+        local_shell_program: Option<String>,
+        local_shell_label: Option<String>,
+        local_cwd: Option<String>,
+    },
+    Split {
+        direction_vertical: bool,
+        ratio: f32,
+        first: Box<SavedPaneNode>,
+        second: Box<SavedPaneNode>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SavedWorkspaceTab {
+    pub title: String,
+    pub root: SavedPaneNode,
+    #[serde(default)]
+    pub broadcast_input: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SavedWorkspaceSession {
+    pub tabs: Vec<SavedWorkspaceTab>,
+    pub active_tab_index: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+enum RestorePaneKind {
+    Ssh {
+        host_id: String,
+    },
+    Local {
+        program: Option<String>,
+        label: Option<String>,
+        cwd: Option<String>,
+    },
+}
+
+fn saved_node_from_split(node: &SplitNode, terminal_tabs: &[TerminalTab]) -> Option<SavedPaneNode> {
+    match node {
+        SplitNode::Leaf { pane_id } => {
+            let pane = terminal_tabs.iter().find(|p| &p.tab_id == pane_id)?;
+            if pane.is_local {
+                Some(SavedPaneNode::Leaf {
+                    host_id: None,
+                    is_local: true,
+                    local_shell_program: Some(pane.hostname.clone()),
+                    local_shell_label: Some(pane.label.clone()),
+                    local_cwd: pane.current_cwd().map(|s| s.to_string()),
+                })
+            } else {
+                pane.host_id.as_ref().map(|hid| SavedPaneNode::Leaf {
+                    host_id: Some(hid.clone()),
+                    is_local: false,
+                    local_shell_program: None,
+                    local_shell_label: None,
+                    local_cwd: None,
+                })
+            }
+        }
+        SplitNode::Split {
+            direction,
+            ratio,
+            first,
+            second,
+            ..
+        } => {
+            let a = saved_node_from_split(first, terminal_tabs);
+            let b = saved_node_from_split(second, terminal_tabs);
+            match (a, b) {
+                (Some(first), Some(second)) => Some(SavedPaneNode::Split {
+                    direction_vertical: *direction == SplitDirection::Vertical,
+                    ratio: *ratio,
+                    first: Box::new(first),
+                    second: Box::new(second),
+                }),
+                (Some(only), None) | (None, Some(only)) => Some(only),
+                (None, None) => None,
+            }
+        }
+    }
+}
+
+fn split_node_from_saved(
+    saved: &SavedPaneNode,
+    hosts: &[HostRecord],
+    out_panes: &mut Vec<(String, RestorePaneKind)>,
+) -> Option<SplitNode> {
+    match saved {
+        SavedPaneNode::Leaf {
+            host_id,
+            is_local,
+            local_shell_program,
+            local_shell_label,
+            local_cwd,
+        } => {
+            let pane_id = Uuid::now_v7().to_string();
+            if *is_local {
+                out_panes.push((
+                    pane_id.clone(),
+                    RestorePaneKind::Local {
+                        program: local_shell_program.clone(),
+                        label: local_shell_label.clone(),
+                        cwd: local_cwd.clone(),
+                    },
+                ));
+                Some(create_leaf(pane_id))
+            } else if let Some(hid) = host_id
+                && hosts.iter().any(|h| &h.id == hid)
+            {
+                out_panes.push((
+                    pane_id.clone(),
+                    RestorePaneKind::Ssh {
+                        host_id: hid.clone(),
+                    },
+                ));
+                Some(create_leaf(pane_id))
+            } else {
+                None
+            }
+        }
+        SavedPaneNode::Split {
+            direction_vertical,
+            ratio,
+            first,
+            second,
+        } => {
+            let left = split_node_from_saved(first, hosts, out_panes);
+            let right = split_node_from_saved(second, hosts, out_panes);
+            match (left, right) {
+                (Some(f), Some(s)) => Some(SplitNode::Split {
+                    id: Uuid::now_v7().to_string(),
+                    direction: if *direction_vertical {
+                        SplitDirection::Vertical
+                    } else {
+                        SplitDirection::Horizontal
+                    },
+                    ratio: ratio.clamp(0.15, 0.85),
+                    first: Box::new(f),
+                    second: Box::new(s),
+                }),
+                (Some(only), None) | (None, Some(only)) => Some(only),
+                (None, None) => None,
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -356,6 +512,14 @@ pub struct StermAdminApp {
     pub keychain_search: Entity<TextField>,
     pub agent_identities: Vec<AgentIdentityInfo>,
     pub agent_error: Option<String>,
+
+    // Phase 5: Multiple SFTP Tabs, OSC 7 CD-Following, Custom Keybindings, Session Restore & Sleep Lock
+    pub sftp_tabs: Vec<SftpTabSnapshot>,
+    pub active_sftp_tab_id: String,
+    pub sftp_drawer_follow_cwd: bool,
+    pub last_drawer_followed_cwd: Option<String>,
+    pub recording_shortcut: Option<ShortcutAction>,
+    pub sessions_restored_once: bool,
 }
 
 impl Focusable for StermAdminApp {
@@ -723,6 +887,9 @@ impl StermAdminApp {
             AuthScreenMode::Login
         };
 
+        let first_sftp_id = Uuid::now_v7().to_string();
+        let initial_sftp_state = SftpWorkspaceState::new(default_local.clone());
+
         let mut app = Self {
             services,
             theme_mode: saved_settings.theme_mode,
@@ -761,7 +928,7 @@ impl StermAdminApp {
             suggestions_manual_open: false,
             suggestions_dismissed: false,
             suggestions_selected_idx: 0,
-            sftp_state: SftpWorkspaceState::new(default_local.clone()),
+            sftp_state: initial_sftp_state.clone(),
             sftp_host_filter,
             modal: None,
             pending_host_keys: VecDeque::new(),
@@ -847,16 +1014,41 @@ impl StermAdminApp {
             keychain_search,
             agent_identities: Vec::new(),
             agent_error: None,
+            sftp_tabs: vec![SftpTabSnapshot {
+                id: first_sftp_id.clone(),
+                label: "SFTP 1".to_string(),
+                state: initial_sftp_state,
+            }],
+            active_sftp_tab_id: first_sftp_id,
+            sftp_drawer_follow_cwd: true,
+            last_drawer_followed_cwd: None,
+            recording_shortcut: None,
+            sessions_restored_once: false,
         };
 
-        // Background ticker: polls active SSH tunnel traffic stats (2s) and checks Auto-Lock idle timer (15s)
+        // Background ticker: polls active SSH tunnel stats (2s), checks OS sleep wake gap, and checks Auto-Lock idle timer (15s)
         {
             let bg_services = Arc::clone(&app.services);
             app.services.rt.spawn(async move {
                 let mut tick: u64 = 0;
+                let mut prev_wall = std::time::SystemTime::now();
+                let mut prev_awake = awake_monotonic_duration();
                 loop {
                     tokio::time::sleep(Duration::from_secs(2)).await;
                     tick = tick.wrapping_add(1);
+                    let now_wall = std::time::SystemTime::now();
+                    let now_awake = awake_monotonic_duration();
+                    let wall_elapsed = now_wall.duration_since(prev_wall).unwrap_or(Duration::ZERO);
+                    let awake_elapsed = now_awake.saturating_sub(prev_awake);
+                    prev_wall = now_wall;
+                    prev_awake = now_awake;
+                    if let Some(slept_secs) =
+                        detect_system_sleep_gap(wall_elapsed, awake_elapsed, Duration::from_secs(20))
+                    {
+                        let _ = bg_services
+                            .ui_tx
+                            .send(UiEvent::SystemSleepDetected { slept_secs });
+                    }
                     let stats = bg_services.ssh.list_tunnels();
                     if !stats.is_empty() {
                         let _ = bg_services
@@ -875,6 +1067,7 @@ impl StermAdminApp {
         if app.vault_status.unlocked {
             app.spawn_detect_local_ssh();
             app.maybe_auto_sync(cx);
+            app.restore_saved_sessions_if_enabled(cx);
         }
         app
     }
@@ -900,6 +1093,7 @@ impl StermAdminApp {
     }
 
     pub fn open_modal(&mut self, modal: ActiveModal, cx: &mut Context<Self>) {
+        self.recording_shortcut = None;
         self.modal = Some(modal);
         self.modal_epoch = self.modal_epoch.wrapping_add(1);
         cx.notify();
@@ -1030,6 +1224,7 @@ impl StermAdminApp {
             && let Ok(vault) = self.services.vault.lock() {
                 let _ = vault.set_meta_string("gpui_settings", &json);
             }
+        self.persist_workspace_sessions();
         cx.notify();
     }
 
@@ -1594,6 +1789,7 @@ impl StermAdminApp {
         if let Ok(mut v) = self.services.vault.lock() {
             v.lock();
         }
+        self.recording_shortcut = None;
         self.modal = None;
         self.reload_vault_snapshot();
         self.set_toast("Vault locked.", false);
@@ -2334,16 +2530,27 @@ impl StermAdminApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.connect_host_ssh_impl(host_id, None, Some(window), cx);
+        self.connect_host_ssh_impl(host_id, None, None, Some(window), cx);
     }
 
     pub fn connect_host_ssh_no_window(&mut self, host_id: String, cx: &mut Context<Self>) {
-        self.connect_host_ssh_impl(host_id, None, None, cx);
+        self.connect_host_ssh_impl(host_id, None, None, None, cx);
+    }
+
+    pub fn connect_host_ssh_with_startup(
+        &mut self,
+        host_id: String,
+        startup_command: Option<String>,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        self.connect_host_ssh_impl(host_id, startup_command, None, window, cx);
     }
 
     fn connect_host_ssh_impl(
         &mut self,
         host_id: String,
+        startup_override: Option<String>,
         split_into: Option<(String, String, SplitDirection)>,
         window: Option<&mut Window>,
         cx: &mut Context<Self>,
@@ -2362,7 +2569,7 @@ impl StermAdminApp {
             )
         };
 
-        let (host, req) = match built {
+        let (host, mut req) = match built {
             Ok(v) => v,
             Err(e) => {
                 self.set_toast(format!("Cannot connect: {e}"), true);
@@ -2370,6 +2577,9 @@ impl StermAdminApp {
                 return;
             }
         };
+        if let Some(cmd) = startup_override {
+            req.startup_command = Some(cmd);
+        }
 
         let pane_id = Uuid::now_v7().to_string();
         let mut pane = TerminalTab::connecting(
@@ -2423,6 +2633,7 @@ impl StermAdminApp {
         }
 
         self.spawn_ssh_for_pane(pane_id, req, host.label, None);
+        self.persist_workspace_sessions();
         cx.notify();
     }
 
@@ -2437,6 +2648,7 @@ impl StermAdminApp {
         if let Some(hid) = host_override {
             self.connect_host_ssh_impl(
                 hid,
+                None,
                 Some((workspace_tab_id, target_pane_id, direction)),
                 None,
                 cx,
@@ -2452,6 +2664,7 @@ impl StermAdminApp {
         {
             self.connect_host_ssh_impl(
                 hid,
+                None,
                 Some((workspace_tab_id, target_pane_id, direction)),
                 None,
                 cx,
@@ -2481,6 +2694,7 @@ impl StermAdminApp {
             .find(|w| w.id == workspace_tab_id)
         {
             ws.root = update_split_ratio(ws.root.clone(), split_id, new_ratio);
+            self.persist_workspace_sessions();
             cx.notify();
         }
     }
@@ -2516,13 +2730,37 @@ impl StermAdminApp {
                 self.focused_pane_tab_id = Some(ws.active_pane_id.clone());
                 window.focus(&self.terminal_focus);
             }
+        self.persist_workspace_sessions();
         cx.notify();
     }
 
+    pub fn reorder_workspace_tabs(
+        &mut self,
+        dragged_id: &str,
+        target_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if reorder_vec_by_id(&mut self.workspace_tabs, dragged_id, target_id, |w| &w.id) {
+            self.persist_workspace_sessions();
+            cx.notify();
+        }
+    }
+
+    fn is_session_referenced_by_sftp(&self, session_id: &str) -> bool {
+        if self.sftp_state.session_id.as_deref() == Some(session_id)
+            || self.sftp_state.left_remote_session_id.as_deref() == Some(session_id)
+        {
+            return true;
+        }
+        self.sftp_tabs.iter().any(|tab| {
+            tab.state.session_id.as_deref() == Some(session_id)
+                || tab.state.left_remote_session_id.as_deref() == Some(session_id)
+        })
+    }
+
     fn close_pane_session_safely(&self, session_id: String) {
-        // Session ref-counting: if SFTP is actively using this SSH session, keep transport alive!
-        let in_use_by_sftp = self.sftp_state.session_id.as_deref() == Some(session_id.as_str());
-        if in_use_by_sftp {
+        // Session ref-counting: if any SFTP tab or drawer is actively using this SSH session, keep transport alive!
+        if self.is_session_referenced_by_sftp(&session_id) {
             if let Ok(mut set) = self.services.sftp_only_sessions.lock() {
                 set.insert(session_id);
             }
@@ -2578,6 +2816,7 @@ impl StermAdminApp {
             }
         }
         self.focused_pane_tab_id = self.active_pane_id();
+        self.persist_workspace_sessions();
         cx.notify();
     }
 
@@ -2608,7 +2847,190 @@ impl StermAdminApp {
             }
             self.focused_pane_tab_id = self.active_pane_id();
         }
+        self.persist_workspace_sessions();
         cx.notify();
+    }
+
+    pub fn persist_workspace_sessions(&self) {
+        if !self.vault_status.unlocked || !self.settings.restore_sessions {
+            return;
+        }
+        let mut tabs = Vec::new();
+        let mut active_tab_index = None;
+        for ws in &self.workspace_tabs {
+            if let Some(root) = saved_node_from_split(&ws.root, &self.terminal_tabs) {
+                if self.active_workspace_tab_id.as_deref() == Some(ws.id.as_str()) {
+                    active_tab_index = Some(tabs.len());
+                }
+                tabs.push(SavedWorkspaceTab {
+                    title: ws.title.clone(),
+                    root,
+                    broadcast_input: ws.broadcast_input,
+                });
+            }
+        }
+        let session = SavedWorkspaceSession {
+            tabs,
+            active_tab_index,
+        };
+        if let Ok(json) = serde_json::to_string(&session)
+            && let Ok(vault) = self.services.vault.lock()
+        {
+            let _ = vault.set_meta_string("saved_workspace_sessions", &json);
+        }
+    }
+
+    pub fn restore_saved_sessions_if_enabled(&mut self, cx: &mut Context<Self>) {
+        if !self.settings.restore_sessions
+            || self.sessions_restored_once
+            || !self.vault_status.unlocked
+            || !self.workspace_tabs.is_empty()
+        {
+            return;
+        }
+        self.sessions_restored_once = true;
+
+        let saved: SavedWorkspaceSession = match self
+            .services
+            .vault
+            .lock()
+            .ok()
+            .and_then(|v| v.get_meta_string("saved_workspace_sessions").ok().flatten())
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+        {
+            Some(s) => s,
+            None => return,
+        };
+        if saved.tabs.is_empty() {
+            return;
+        }
+
+        let avail_shells = LocalShellManager::available_shells();
+        let dummy_t = ThemePalette::from_settings(&self.settings);
+        let mut restored_tabs = 0usize;
+
+        for saved_tab in saved.tabs {
+            let mut out_panes = Vec::new();
+            let Some(root) =
+                split_node_from_saved(&saved_tab.root, &self.snapshot.hosts, &mut out_panes)
+            else {
+                continue;
+            };
+            let mut root_opt = Some(root);
+
+            for (pane_id, kind) in out_panes {
+                match kind {
+                    RestorePaneKind::Local {
+                        program,
+                        label,
+                        cwd,
+                    } => {
+                        let shell = avail_shells
+                            .iter()
+                            .find(|s| {
+                                program.as_deref() == Some(s.program.as_str())
+                                    || label.as_deref() == Some(s.label.as_str())
+                            })
+                            .cloned()
+                            .unwrap_or_else(LocalShellManager::default_shell);
+                        let initial_dir = cwd
+                            .as_deref()
+                            .map(std::path::PathBuf::from)
+                            .filter(|p| p.is_dir());
+                        let ui_tx = self.services.ui_tx.clone();
+                        let pane_for_stream = pane_id.clone();
+                        match self.services.local_shells.spawn(
+                            &shell,
+                            initial_dir,
+                            DEFAULT_TERM_COLS,
+                            DEFAULT_TERM_ROWS,
+                            move |ev| {
+                                let _ = ui_tx.send(UiEvent::TerminalOutput {
+                                    tab_id: pane_for_stream.clone(),
+                                    event: ev,
+                                });
+                            },
+                        ) {
+                            Ok(sid) => {
+                                let mut pane = TerminalTab::local_shell(
+                                    pane_id,
+                                    shell.label,
+                                    sid,
+                                    shell.program,
+                                );
+                                pane.line_height_mult = self.settings.terminal_line_height;
+                                self.terminal_tabs.push(pane);
+                            }
+                            Err(_) => {
+                                root_opt = root_opt.and_then(|r| tree_close_pane(r, &pane_id));
+                            }
+                        }
+                    }
+                    RestorePaneKind::Ssh { host_id } => {
+                        let built = self.services.vault.lock().ok().and_then(|v| {
+                            build_connect_request_for_host(
+                                &v,
+                                &host_id,
+                                DEFAULT_TERM_COLS as u32,
+                                DEFAULT_TERM_ROWS as u32,
+                                None,
+                            )
+                            .ok()
+                        });
+                        if let Some((host, req)) = built {
+                            let mut pane = TerminalTab::connecting(
+                                pane_id.clone(),
+                                Some(host.id.clone()),
+                                host.label.clone(),
+                                host.hostname.clone(),
+                                host.port,
+                                host.username.clone(),
+                            );
+                            let group_name = host
+                                .group_id
+                                .as_deref()
+                                .and_then(|gid| {
+                                    self.snapshot.groups.iter().find(|g| g.id == gid)
+                                })
+                                .map(|g| g.name.as_str());
+                            pane.env_label = env_badge_for_host(&host.tags, group_name, &dummy_t)
+                                .map(|(_, lbl)| lbl);
+                            pane.theme_id = host.terminal_theme.clone();
+                            pane.line_height_mult = self.settings.terminal_line_height;
+                            self.terminal_tabs.push(pane);
+                            self.spawn_ssh_for_pane(pane_id, req, host.label, None);
+                        } else {
+                            root_opt = root_opt.and_then(|r| tree_close_pane(r, &pane_id));
+                        }
+                    }
+                }
+            }
+
+            if let Some(final_root) = root_opt {
+                let pane_ids = collect_pane_ids(&final_root);
+                let active_pane_id = pane_ids.into_iter().next().unwrap_or_default();
+                self.workspace_tabs.push(WorkspaceTab {
+                    id: Uuid::now_v7().to_string(),
+                    title: saved_tab.title,
+                    root: final_root,
+                    active_pane_id,
+                    broadcast_input: saved_tab.broadcast_input,
+                });
+                restored_tabs += 1;
+            }
+        }
+
+        if restored_tabs > 0 {
+            if let Some(ix) = saved.active_tab_index
+                && let Some(ws) = self.workspace_tabs.get(ix)
+            {
+                self.active_workspace_tab_id = Some(ws.id.clone());
+                self.focused_pane_tab_id = Some(ws.active_pane_id.clone());
+            }
+            self.page_epoch = self.page_epoch.wrapping_add(1);
+            self.set_toast(format!("Restored {restored_tabs} workspace tab(s)."), false);
+            cx.notify();
+        }
     }
 
     pub fn reconnect_terminal_pane(
@@ -3075,6 +3497,17 @@ impl StermAdminApp {
         window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) {
+        self.open_local_shell_in_dir(spec, None, split_into, window, cx);
+    }
+
+    pub fn open_local_shell_in_dir(
+        &mut self,
+        spec: Option<LocalShellSpec>,
+        initial_cwd: Option<PathBuf>,
+        split_into: Option<(String, String, SplitDirection)>,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
         let shell = spec.unwrap_or_else(LocalShellManager::default_shell);
         let pane_id = Uuid::now_v7().to_string();
         let ui_tx = self.services.ui_tx.clone();
@@ -3082,6 +3515,7 @@ impl StermAdminApp {
 
         let session_id = match self.services.local_shells.spawn(
             &shell,
+            initial_cwd,
             DEFAULT_TERM_COLS,
             DEFAULT_TERM_ROWS,
             move |ev| {
@@ -3139,6 +3573,7 @@ impl StermAdminApp {
         if let Some(w) = window {
             w.focus(&self.terminal_focus);
         }
+        self.persist_workspace_sessions();
         cx.notify();
     }
 
@@ -3156,6 +3591,26 @@ impl StermAdminApp {
             };
             self.set_toast(state, false);
         }
+        self.persist_workspace_sessions();
+        cx.notify();
+    }
+
+    pub fn toggle_sftp_drawer_follow_cwd(&mut self, cx: &mut Context<Self>) {
+        self.sftp_drawer_follow_cwd = !self.sftp_drawer_follow_cwd;
+        if self.sftp_drawer_follow_cwd
+            && self.sftp_drawer_open
+            && let Some(pid) = self.active_pane_id()
+            && let Some((sid, cwd)) = self
+                .terminal_tabs
+                .iter()
+                .find(|p| p.tab_id == pid && !p.is_local)
+                .and_then(|p| Some((p.session_id.as_deref()?, p.current_cwd()?.to_string())))
+            && self.sftp_state.session_id.as_deref() == Some(sid)
+            && self.sftp_state.remote_path != cwd
+        {
+            self.last_drawer_followed_cwd = Some(cwd.clone());
+            self.refresh_remote_dir(cwd);
+        }
         cx.notify();
     }
 
@@ -3169,8 +3624,17 @@ impl StermAdminApp {
             .terminal_tabs
             .iter()
             .find(|p| p.tab_id == pane_id && p.connected && !p.is_local)
-            .and_then(|p| p.session_id.clone().map(|sid| (sid, p.label.clone())));
-        let Some((session_id, host_label)) = info else {
+            .and_then(|p| {
+                p.session_id.clone().map(|sid| {
+                    (
+                        sid,
+                        p.label.clone(),
+                        p.host_id.clone(),
+                        p.current_cwd().map(|s| s.to_string()),
+                    )
+                })
+            });
+        let Some((session_id, host_label, host_id, pane_cwd)) = info else {
             self.set_toast("Connect an SSH pane first to open the docked SFTP drawer.", true);
             cx.notify();
             return;
@@ -3179,19 +3643,41 @@ impl StermAdminApp {
         if self.sftp_state.session_id.as_deref() != Some(session_id.as_str()) {
             self.close_previous_sftp_if_standalone();
             self.sftp_state.connecting = true;
+            self.sftp_state.host_id = host_id;
+            self.last_drawer_followed_cwd = pane_cwd.clone();
+            let follow_cwd = self.sftp_drawer_follow_cwd;
+            let target_sftp_tab = Some(self.active_sftp_tab_id.clone());
             let services = Arc::clone(&self.services);
             self.services.rt.spawn(async move {
                 match services.sftp.attach_to_ssh(&services.ssh, &session_id).await {
                     Ok(remote_cwd) => {
                         let local_cwd = SftpManager::default_local_dir();
+                        let (effective_cwd, prelisted) =
+                            if follow_cwd && let Some(ref cwd) = pane_cwd {
+                                match services.sftp.list_remote_dir(&session_id, cwd).await {
+                                    Ok((resolved, entries)) => {
+                                        (resolved.clone(), Some((resolved, entries)))
+                                    }
+                                    Err(_) => (remote_cwd.clone(), None),
+                                }
+                            } else {
+                                (remote_cwd.clone(), None)
+                            };
                         let _ = services.ui_tx.send(UiEvent::SftpConnected {
                             session_id: session_id.clone(),
                             host_label,
-                            remote_cwd: remote_cwd.clone(),
+                            remote_cwd: effective_cwd.clone(),
                             local_cwd,
+                            sftp_tab_id: target_sftp_tab,
                         });
-                        if let Ok((resolved, entries)) =
-                            services.sftp.list_remote_dir(&session_id, &remote_cwd).await
+                        if let Some((resolved, entries)) = prelisted {
+                            let _ = services.ui_tx.send(UiEvent::SftpRemoteListed {
+                                session_id,
+                                path: resolved,
+                                entries,
+                            });
+                        } else if let Ok((resolved, entries)) =
+                            services.sftp.list_remote_dir(&session_id, &effective_cwd).await
                         {
                             let _ = services.ui_tx.send(UiEvent::SftpRemoteListed {
                                 session_id,
@@ -3207,6 +3693,17 @@ impl StermAdminApp {
                     }
                 }
             });
+        } else {
+            if self.sftp_state.host_id.is_none() {
+                self.sftp_state.host_id = host_id;
+            }
+            if self.sftp_drawer_follow_cwd
+                && let Some(cwd) = pane_cwd
+                && self.sftp_state.remote_path != cwd
+            {
+                self.last_drawer_followed_cwd = Some(cwd.clone());
+                self.refresh_remote_dir(cwd);
+            }
         }
         cx.notify();
     }
@@ -3821,6 +4318,7 @@ impl StermAdminApp {
                 self.set_toast("Vault unlocked via OS Keychain.", false);
                 self.spawn_detect_local_ssh();
                 self.maybe_auto_sync(cx);
+                self.restore_saved_sessions_if_enabled(cx);
             }
             Ok(None) => {
                 self.set_toast(
@@ -3858,21 +4356,49 @@ impl StermAdminApp {
 
     // --- Remote ↔ Remote SFTP & External Editor Watch-Upload + Retry ---
 
+    fn is_session_referenced_elsewhere(&self, sid: &str, ignore_sftp_tab_id: Option<&str>) -> bool {
+        if self
+            .terminal_tabs
+            .iter()
+            .any(|p| p.session_id.as_deref() == Some(sid))
+        {
+            return true;
+        }
+        if ignore_sftp_tab_id != Some(self.active_sftp_tab_id.as_str())
+            && (self.sftp_state.session_id.as_deref() == Some(sid)
+                || self.sftp_state.left_remote_session_id.as_deref() == Some(sid))
+        {
+            return true;
+        }
+        self.sftp_tabs.iter().any(|tab| {
+            Some(tab.id.as_str()) != ignore_sftp_tab_id
+                && (tab.state.session_id.as_deref() == Some(sid)
+                    || tab.state.left_remote_session_id.as_deref() == Some(sid))
+        })
+    }
+
+    fn release_sftp_session_if_unused(&self, sid: String, ignore_sftp_tab_id: Option<&str>) {
+        if self.is_session_referenced_elsewhere(&sid, ignore_sftp_tab_id) {
+            return;
+        }
+        let is_standalone = self
+            .services
+            .sftp_only_sessions
+            .lock()
+            .map(|mut s| s.remove(&sid))
+            .unwrap_or(false);
+        if is_standalone {
+            let services = Arc::clone(&self.services);
+            self.services.rt.spawn(async move {
+                services.sftp.close(&sid).await;
+                let _ = services.ssh.close_session(&sid).await;
+            });
+        }
+    }
+
     fn close_left_remote_sftp_if_standalone(&self) {
         if let Some(prev_sid) = self.sftp_state.left_remote_session_id.clone() {
-            let is_standalone = self
-                .services
-                .sftp_only_sessions
-                .lock()
-                .map(|mut s| s.remove(&prev_sid))
-                .unwrap_or(false);
-            if is_standalone {
-                let services = Arc::clone(&self.services);
-                self.services.rt.spawn(async move {
-                    services.sftp.close(&prev_sid).await;
-                    let _ = services.ssh.close_session(&prev_sid).await;
-                });
-            }
+            self.release_sftp_session_if_unused(prev_sid, Some(&self.active_sftp_tab_id));
         }
     }
 
@@ -3887,6 +4413,7 @@ impl StermAdminApp {
         self.sftp_state.local_path = default_local.clone();
         self.sftp_local_path_input
             .update(cx, |f, cx| f.set_value(default_local.clone(), cx));
+        self.sync_active_sftp_tab_from_state();
         self.refresh_local_dir(default_local);
         cx.notify();
     }
@@ -4454,28 +4981,86 @@ impl StermAdminApp {
         let ks = &event.keystroke;
         let mod_key = ks.modifiers.control || ks.modifiers.platform;
 
-        if ks.key == "escape"
-            && let Some(ref modal) = self.modal {
-                // Never bypass mandatory HostKey/KBI responses silently on Escape without resolving
-                match modal {
-                    ActiveModal::HostKey(_) | ActiveModal::KeyboardInteractive(_) => {}
-                    _ => {
-                        self.modal = None;
-                        cx.notify();
-                        return;
+        if self.vault_status.unlocked
+            && matches!(self.modal, Some(ActiveModal::ShortcutsHelp))
+            && let Some(action) = self.recording_shortcut
+        {
+            if ks.key == "escape" {
+                self.recording_shortcut = None;
+                cx.notify();
+                return;
+            }
+            let raw = ks.key.trim().to_ascii_lowercase();
+            if matches!(
+                raw.as_str(),
+                "control"
+                    | "shift"
+                    | "alt"
+                    | "platform"
+                    | "meta"
+                    | "super"
+                    | "capslock"
+                    | "fn"
+            ) {
+                return;
+            }
+            if let Some(binding) = KeyBinding::from_keystroke(ks) {
+                let prev = self.settings.keybindings.get(action).clone();
+                let mut swapped_with: Option<ShortcutAction> = None;
+                for other in ShortcutAction::ALL {
+                    if other != action && *self.settings.keybindings.get(other) == binding {
+                        self.settings.keybindings.set(other, prev.clone());
+                        swapped_with = Some(other);
+                        break;
                     }
                 }
+                self.settings.keybindings.set(action, binding.clone());
+                self.recording_shortcut = None;
+                self.save_settings(cx);
+                let msg = match swapped_with {
+                    Some(other) => format!(
+                        "Bound '{}' to {} (swapped with '{}').",
+                        action.label(),
+                        binding.display(),
+                        other.label()
+                    ),
+                    None => format!("Bound '{}' to {}.", action.label(), binding.display()),
+                };
+                self.set_toast(msg, false);
+                return;
             }
-
-        if !mod_key || !self.vault_status.unlocked {
+            self.set_toast("Include Ctrl/Cmd, Alt, or use F1-F12 for shortcuts.", true);
+            cx.notify();
             return;
         }
 
-        if ks.key.eq_ignore_ascii_case("k") {
+        if ks.key == "escape"
+            && let Some(ref modal) = self.modal
+        {
+            // Never bypass mandatory HostKey/KBI responses silently on Escape without resolving
+            match modal {
+                ActiveModal::HostKey(_) | ActiveModal::KeyboardInteractive(_) => {}
+                _ => {
+                    self.recording_shortcut = None;
+                    self.modal = None;
+                    cx.notify();
+                    return;
+                }
+            }
+        }
+
+        if !self.vault_status.unlocked {
+            return;
+        }
+
+        if self.settings.keybindings.matches(ShortcutAction::CommandPalette, ks) {
             self.open_command_palette(cx);
-        } else if ks.key == "/" || ks.key == "?" {
+        } else if self.settings.keybindings.matches(ShortcutAction::ShortcutsHelp, ks) {
             self.open_modal(ActiveModal::ShortcutsHelp, cx);
-        } else if ks.key.len() == 1
+        } else if self.settings.keybindings.matches(ShortcutAction::OpenLocalShell, ks) {
+            self.open_local_shell_in_dir(None, None, None, Some(_window), cx);
+        } else if mod_key
+            && ks.key.len() == 1
             && let Some(digit) = ks.key.chars().next().and_then(|c| c.to_digit(10))
             && (1..=9).contains(&digit)
         {
@@ -4485,23 +5070,23 @@ impl StermAdminApp {
                 let wid = ws.id.clone();
                 self.select_workspace_tab(Some(wid), _window, cx);
             }
-        } else if ks.key.eq_ignore_ascii_case("l") && ks.modifiers.shift {
+        } else if self.settings.keybindings.matches(ShortcutAction::LockVault, ks) {
             self.lock_vault(cx);
-        } else if ks.key.eq_ignore_ascii_case("w") {
+        } else if self.settings.keybindings.matches(ShortcutAction::CloseTab, ks) {
             if let Some(ws_id) = self.active_workspace_tab_id.clone() {
                 self.close_workspace_tab(ws_id, cx);
             }
-        } else if ks.key.eq_ignore_ascii_case("d")
+        } else if self.settings.keybindings.matches(ShortcutAction::SplitHorizontal, ks)
             && let (Some(ws_id), Some(pid)) =
                 (self.active_workspace_tab_id.clone(), self.active_pane_id())
-            {
-                let dir = if ks.modifiers.shift {
-                    SplitDirection::Vertical
-                } else {
-                    SplitDirection::Horizontal
-                };
-                self.split_pane_duplicate_or_host(ws_id, pid, dir, None, cx);
-            }
+        {
+            self.split_pane_duplicate_or_host(ws_id, pid, SplitDirection::Horizontal, None, cx);
+        } else if self.settings.keybindings.matches(ShortcutAction::SplitVertical, ks)
+            && let (Some(ws_id), Some(pid)) =
+                (self.active_workspace_tab_id.clone(), self.active_pane_id())
+        {
+            self.split_pane_duplicate_or_host(ws_id, pid, SplitDirection::Vertical, None, cx);
+        }
     }
 
     pub fn handle_terminal_key_down(
@@ -4520,13 +5105,17 @@ impl StermAdminApp {
         let ks = &event.keystroke;
         let mod_key = ks.modifiers.control || ks.modifiers.platform;
 
-        // Global shortcuts while terminal is focused
-        if mod_key && ks.key.eq_ignore_ascii_case("k") {
+        // Global customizable shortcuts while terminal is focused
+        if self.settings.keybindings.matches(ShortcutAction::CommandPalette, ks) {
             self.open_command_palette(cx);
             return;
         }
-        if mod_key && (ks.key == "/" || ks.key == "?") {
+        if self.settings.keybindings.matches(ShortcutAction::ShortcutsHelp, ks) {
             self.open_modal(ActiveModal::ShortcutsHelp, cx);
+            return;
+        }
+        if self.settings.keybindings.matches(ShortcutAction::OpenLocalShell, ks) {
+            self.open_local_shell_in_dir(None, None, None, Some(_window), cx);
             return;
         }
         if mod_key
@@ -4542,33 +5131,46 @@ impl StermAdminApp {
             }
             return;
         }
-        if mod_key && ks.key.eq_ignore_ascii_case("f") {
+        if self.settings.keybindings.matches(ShortcutAction::TerminalSearch, ks) {
             self.term_search_open = !self.term_search_open;
             cx.notify();
             return;
         }
-        if mod_key && ks.key.eq_ignore_ascii_case("d") {
+        if self.settings.keybindings.matches(ShortcutAction::SplitHorizontal, ks) {
             if let Some(ws_id) = self.active_workspace_tab_id.clone() {
-                let dir = if ks.modifiers.shift {
-                    SplitDirection::Vertical
-                } else {
-                    SplitDirection::Horizontal
-                };
-                self.split_pane_duplicate_or_host(ws_id, tab_id, dir, None, cx);
+                self.split_pane_duplicate_or_host(
+                    ws_id,
+                    tab_id,
+                    SplitDirection::Horizontal,
+                    None,
+                    cx,
+                );
             }
             return;
         }
-        if mod_key && ks.key.eq_ignore_ascii_case("w") {
+        if self.settings.keybindings.matches(ShortcutAction::SplitVertical, ks) {
+            if let Some(ws_id) = self.active_workspace_tab_id.clone() {
+                self.split_pane_duplicate_or_host(
+                    ws_id,
+                    tab_id,
+                    SplitDirection::Vertical,
+                    None,
+                    cx,
+                );
+            }
+            return;
+        }
+        if self.settings.keybindings.matches(ShortcutAction::CloseTab, ks) {
             if let Some(ws_id) = self.active_workspace_tab_id.clone() {
                 self.close_workspace_tab(ws_id, cx);
             }
             return;
         }
-        if mod_key && ks.modifiers.shift && ks.key.eq_ignore_ascii_case("l") {
+        if self.settings.keybindings.matches(ShortcutAction::LockVault, ks) {
             self.lock_vault(cx);
             return;
         }
-        if mod_key && ks.key == "space" {
+        if self.settings.keybindings.matches(ShortcutAction::ToggleSuggestions, ks) {
             self.suggestions_manual_open = !self.suggestions_manual_open;
             self.suggestions_dismissed = false;
             self.suggestions_selected_idx = 0;
@@ -4727,21 +5329,208 @@ impl StermAdminApp {
     // Dual-Pane SFTP Operations (Ref-Counted + Rename + Chmod + Hidden + Drag-Drop)
     // -------------------------------------------------------------------------
 
+    fn sftp_tab_label_for(state: &SftpWorkspaceState, fallback_ix: usize) -> String {
+        match (&state.left_remote_host_label, &state.host_label) {
+            (Some(l), Some(r)) => format!("{l} ↔ {r}"),
+            (None, Some(r)) => r.clone(),
+            (Some(l), None) => format!("{l} ↔ Local"),
+            (None, None) => format!("SFTP {}", fallback_ix + 1),
+        }
+    }
+
+    pub fn sync_active_sftp_tab_from_state(&mut self) {
+        if let Some(ix) = self
+            .sftp_tabs
+            .iter()
+            .position(|tab| tab.id == self.active_sftp_tab_id)
+        {
+            self.sftp_tabs[ix].state = self.sftp_state.clone();
+            self.sftp_tabs[ix].label = Self::sftp_tab_label_for(&self.sftp_state, ix);
+        }
+    }
+
+    pub fn new_sftp_tab(&mut self, cx: &mut Context<Self>) {
+        self.sync_active_sftp_tab_from_state();
+        let id = Uuid::now_v7().to_string();
+        let idx = self.sftp_tabs.len() + 1;
+        let fresh = SftpWorkspaceState::new(SftpManager::default_local_dir());
+        let local = fresh.local_path.clone();
+        let remote = fresh.remote_path.clone();
+        self.sftp_tabs.push(SftpTabSnapshot {
+            id: id.clone(),
+            label: format!("SFTP {idx}"),
+            state: fresh.clone(),
+        });
+        self.active_sftp_tab_id = id;
+        self.sftp_state = fresh;
+        self.sftp_local_path_input
+            .update(cx, |f, cx| f.set_value(local.clone(), cx));
+        self.sftp_remote_path_input
+            .update(cx, |f, cx| f.set_value(remote, cx));
+        self.refresh_local_dir(local);
+        cx.notify();
+    }
+
+    pub fn select_sftp_tab(&mut self, tab_id: String, cx: &mut Context<Self>) {
+        if self.active_sftp_tab_id == tab_id {
+            return;
+        }
+        self.sync_active_sftp_tab_from_state();
+        if let Some(tab) = self.sftp_tabs.iter().find(|t| t.id == tab_id) {
+            self.active_sftp_tab_id = tab_id;
+            self.sftp_state = tab.state.clone();
+            let local = self.sftp_state.local_path.clone();
+            let remote = self.sftp_state.remote_path.clone();
+            self.sftp_local_path_input
+                .update(cx, |f, cx| f.set_value(local, cx));
+            self.sftp_remote_path_input
+                .update(cx, |f, cx| f.set_value(remote, cx));
+        }
+        cx.notify();
+    }
+
+    pub fn close_sftp_tab(&mut self, tab_id: String, cx: &mut Context<Self>) {
+        self.sync_active_sftp_tab_from_state();
+        if self.sftp_tabs.len() <= 1 {
+            let right_sid = self.sftp_state.session_id.take();
+            let left_sid = self.sftp_state.left_remote_session_id.take();
+            let fresh = SftpWorkspaceState::new(SftpManager::default_local_dir());
+            let local = fresh.local_path.clone();
+            let remote = fresh.remote_path.clone();
+            self.sftp_state = fresh.clone();
+            if let Some(first) = self.sftp_tabs.first_mut() {
+                first.label = "SFTP 1".to_string();
+                first.state = fresh;
+            }
+            self.sftp_local_path_input
+                .update(cx, |f, cx| f.set_value(local.clone(), cx));
+            self.sftp_remote_path_input
+                .update(cx, |f, cx| f.set_value(remote, cx));
+            if let Some(sid) = right_sid {
+                self.release_sftp_session_if_unused(sid, None);
+            }
+            if let Some(sid) = left_sid {
+                self.release_sftp_session_if_unused(sid, None);
+            }
+            self.refresh_local_dir(local);
+            cx.notify();
+            return;
+        }
+        if let Some(pos) = self.sftp_tabs.iter().position(|t| t.id == tab_id) {
+            let removed = self.sftp_tabs.remove(pos);
+            if self.active_sftp_tab_id == tab_id {
+                let next_ix = pos.min(self.sftp_tabs.len() - 1);
+                let next = &self.sftp_tabs[next_ix];
+                self.active_sftp_tab_id = next.id.clone();
+                self.sftp_state = next.state.clone();
+                let local = self.sftp_state.local_path.clone();
+                let remote = self.sftp_state.remote_path.clone();
+                self.sftp_local_path_input
+                    .update(cx, |f, cx| f.set_value(local, cx));
+                self.sftp_remote_path_input
+                    .update(cx, |f, cx| f.set_value(remote, cx));
+            }
+            if let Some(sid) = removed.state.session_id {
+                self.release_sftp_session_if_unused(sid, None);
+            }
+            if let Some(sid) = removed.state.left_remote_session_id {
+                self.release_sftp_session_if_unused(sid, None);
+            }
+        }
+        cx.notify();
+    }
+
+    pub fn reorder_sftp_tabs(&mut self, dragged_id: &str, target_id: &str, cx: &mut Context<Self>) {
+        self.sync_active_sftp_tab_from_state();
+        if reorder_vec_by_id(&mut self.sftp_tabs, dragged_id, target_id, |t| &t.id) {
+            cx.notify();
+        }
+    }
+
+    fn resolve_host_id_for_sftp_session(
+        &self,
+        preferred_host_id: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Option<String> {
+        if let Some(hid) = preferred_host_id
+            && self.snapshot.hosts.iter().any(|h| h.id == hid)
+        {
+            return Some(hid.to_string());
+        }
+        if let Some(sid) = session_id
+            && let Some(pane) = self
+                .terminal_tabs
+                .iter()
+                .find(|p| !p.is_local && p.session_id.as_deref() == Some(sid))
+        {
+            if let Some(hid) = pane.host_id.as_ref() {
+                return Some(hid.clone());
+            }
+            if let Some(found) = self.snapshot.hosts.iter().find(|h| {
+                h.hostname == pane.hostname && h.port == pane.port && h.username == pane.username
+            }) {
+                return Some(found.id.clone());
+            }
+        }
+        None
+    }
+
+    pub fn open_local_terminal_here(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sftp_state.is_left_remote() {
+            let dir = self.sftp_state.local_path.clone();
+            let hid = self.resolve_host_id_for_sftp_session(
+                self.sftp_state.left_remote_host_id.as_deref(),
+                self.sftp_state.left_remote_session_id.as_deref(),
+            );
+            if let Some(host_id) = hid {
+                let startup = build_remote_cd_command(&dir);
+                self.connect_host_ssh_with_startup(host_id, startup, Some(window), cx);
+                self.set_toast(format!("Opening SSH terminal at {dir}..."), false);
+            } else {
+                self.set_toast(
+                    "Save this host to the Vault first to open a new SSH terminal at a directory.",
+                    true,
+                );
+                cx.notify();
+            }
+            return;
+        }
+        let dir = self.sftp_state.local_path.clone();
+        self.open_local_shell_in_dir(
+            None,
+            Some(PathBuf::from(&dir)),
+            None,
+            Some(window),
+            cx,
+        );
+    }
+
+    pub fn open_remote_terminal_here(
+        &mut self,
+        target_dir: String,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        let hid = self.resolve_host_id_for_sftp_session(
+            self.sftp_state.host_id.as_deref(),
+            self.sftp_state.session_id.as_deref(),
+        );
+        if let Some(host_id) = hid {
+            let startup = build_remote_cd_command(&target_dir);
+            self.connect_host_ssh_with_startup(host_id, startup, window, cx);
+            self.set_toast(format!("Opening SSH terminal at {target_dir}..."), false);
+        } else {
+            self.set_toast(
+                "Save this host to the Vault first to open a new SSH terminal at a directory.",
+                true,
+            );
+            cx.notify();
+        }
+    }
+
     fn close_previous_sftp_if_standalone(&self) {
         if let Some(prev_sid) = self.sftp_state.session_id.clone() {
-            let is_standalone = self
-                .services
-                .sftp_only_sessions
-                .lock()
-                .map(|mut s| s.remove(&prev_sid))
-                .unwrap_or(false);
-            if is_standalone {
-                let services = Arc::clone(&self.services);
-                self.services.rt.spawn(async move {
-                    services.sftp.close(&prev_sid).await;
-                    let _ = services.ssh.close_session(&prev_sid).await;
-                });
-            }
+            self.release_sftp_session_if_unused(prev_sid, Some(&self.active_sftp_tab_id));
         }
     }
 
@@ -4768,6 +5557,8 @@ impl StermAdminApp {
         self.page_epoch = self.page_epoch.wrapping_add(1);
         self.sftp_state.connecting = true;
         self.sftp_state.host_id = Some(host.id.clone());
+        let target_sftp_tab = Some(self.active_sftp_tab_id.clone());
+        self.sync_active_sftp_tab_from_state();
         self.refresh_local_dir(self.sftp_state.local_path.clone());
 
         let services = Arc::clone(&self.services);
@@ -4787,6 +5578,7 @@ impl StermAdminApp {
                                 host_label: label,
                                 remote_cwd: remote_cwd.clone(),
                                 local_cwd,
+                                sftp_tab_id: target_sftp_tab,
                             });
                             if let Ok((resolved, entries)) =
                                 services.sftp.list_remote_dir(&session_id, &remote_cwd).await
@@ -4821,13 +5613,39 @@ impl StermAdminApp {
         host_label: String,
         cx: &mut Context<Self>,
     ) {
-        if self.sftp_state.session_id.as_deref() != Some(session_id.as_str()) {
-            self.close_previous_sftp_if_standalone();
+        self.sync_active_sftp_tab_from_state();
+        if let Some(existing_id) = self
+            .sftp_tabs
+            .iter()
+            .find(|t| t.state.session_id.as_deref() == Some(session_id.as_str()))
+            .map(|t| t.id.clone())
+        {
+            self.select_sftp_tab(existing_id, cx);
+            self.active_workspace_tab_id = None;
+            self.page = AdminPage::Sftp;
+            self.page_epoch = self.page_epoch.wrapping_add(1);
+            let cur = self.sftp_state.remote_path.clone();
+            self.refresh_remote_dir(cur);
+            cx.notify();
+            return;
         }
+        if self.sftp_state.session_id.is_some()
+            && self.sftp_state.session_id.as_deref() != Some(session_id.as_str())
+        {
+            self.new_sftp_tab(cx);
+        }
+        let pane_host_id = self
+            .terminal_tabs
+            .iter()
+            .find(|p| p.session_id.as_deref() == Some(session_id.as_str()))
+            .and_then(|p| p.host_id.clone());
         self.active_workspace_tab_id = None;
         self.page = AdminPage::Sftp;
         self.page_epoch = self.page_epoch.wrapping_add(1);
         self.sftp_state.connecting = true;
+        self.sftp_state.host_id = pane_host_id;
+        let target_sftp_tab = Some(self.active_sftp_tab_id.clone());
+        self.sync_active_sftp_tab_from_state();
         self.refresh_local_dir(self.sftp_state.local_path.clone());
 
         let services = Arc::clone(&self.services);
@@ -4840,6 +5658,7 @@ impl StermAdminApp {
                         host_label,
                         remote_cwd: remote_cwd.clone(),
                         local_cwd,
+                        sftp_tab_id: target_sftp_tab,
                     });
                     if let Ok((resolved, entries)) =
                         services.sftp.list_remote_dir(&session_id, &remote_cwd).await
@@ -5793,9 +6612,20 @@ impl StermAdminApp {
             }
             UiEvent::TerminalOutput { tab_id, event } => {
                 let mut schedule_reconnect: Option<(String, u32)> = None;
+                let mut follow_candidate: Option<(String, String)> = None;
                 if let Some(tab) = self.terminal_tabs.iter_mut().find(|t| t.tab_id == tab_id) {
                     match event {
-                        TerminalEvent::Output { data } => tab.feed_bytes(&data),
+                        TerminalEvent::Output { data } => {
+                            tab.feed_bytes(&data);
+                            if self.sftp_drawer_open
+                                && self.sftp_drawer_follow_cwd
+                                && !tab.is_local
+                                && let Some(sid) = tab.session_id.as_ref()
+                                && let Some(cwd) = tab.current_cwd()
+                            {
+                                follow_candidate = Some((sid.clone(), cwd.to_string()));
+                            }
+                        }
                         TerminalEvent::Closed { reason } => {
                             tab.connected = false;
                             tab.status_line = format!("Closed: {reason}");
@@ -5823,6 +6653,15 @@ impl StermAdminApp {
                             tab.append_system_line(&format!("Error: {message}"));
                         }
                     }
+                }
+                if let Some((sid, cwd)) = follow_candidate
+                    && self.active_pane_id().as_deref() == Some(tab_id.as_str())
+                    && self.sftp_state.session_id.as_deref() == Some(sid.as_str())
+                    && self.last_drawer_followed_cwd.as_deref() != Some(cwd.as_str())
+                    && self.sftp_state.remote_path != cwd
+                {
+                    self.last_drawer_followed_cwd = Some(cwd.clone());
+                    self.refresh_remote_dir(cwd);
                 }
                 if let Some((pid, attempt)) = schedule_reconnect {
                     let delay_secs = (1u64 << attempt).min(30);
@@ -5895,19 +6734,37 @@ impl StermAdminApp {
                 host_label,
                 remote_cwd,
                 local_cwd,
+                sftp_tab_id,
             } => {
-                self.sftp_state.connecting = false;
-                self.sftp_state.session_id = Some(session_id);
-                self.sftp_state.host_label = Some(host_label.clone());
-                self.sftp_state.remote_path = remote_cwd.clone();
-                self.sftp_remote_path_input
-                    .update(cx, |f, cx| f.set_value(remote_cwd, cx));
-                self.sftp_state.selected_remote = None;
-                self.sftp_state.reset_remote_scroll();
-                self.sftp_state.local_path = local_cwd.clone();
-                self.sftp_local_path_input
-                    .update(cx, |f, cx| f.set_value(local_cwd.clone(), cx));
-                self.refresh_local_dir(local_cwd);
+                let is_active_target = sftp_tab_id
+                    .as_deref()
+                    .is_none_or(|id| id == self.active_sftp_tab_id.as_str());
+                if is_active_target {
+                    self.sftp_state.connecting = false;
+                    self.sftp_state.session_id = Some(session_id);
+                    self.sftp_state.host_label = Some(host_label.clone());
+                    self.sftp_state.remote_path = remote_cwd.clone();
+                    self.sftp_remote_path_input
+                        .update(cx, |f, cx| f.set_value(remote_cwd, cx));
+                    self.sftp_state.selected_remote = None;
+                    self.sftp_state.reset_remote_scroll();
+                    self.sftp_state.local_path = local_cwd.clone();
+                    self.sftp_local_path_input
+                        .update(cx, |f, cx| f.set_value(local_cwd.clone(), cx));
+                    self.sync_active_sftp_tab_from_state();
+                    self.refresh_local_dir(local_cwd);
+                } else if let Some(tid) = sftp_tab_id
+                    && let Some(ix) = self.sftp_tabs.iter().position(|t| t.id == tid)
+                {
+                    let tab = &mut self.sftp_tabs[ix];
+                    tab.state.connecting = false;
+                    tab.state.session_id = Some(session_id);
+                    tab.state.host_label = Some(host_label.clone());
+                    tab.state.remote_path = remote_cwd;
+                    tab.state.selected_remote = None;
+                    tab.state.local_path = local_cwd;
+                    tab.label = Self::sftp_tab_label_for(&tab.state, ix);
+                }
                 self.set_toast(format!("SFTP connected to {host_label}."), false);
             }
             UiEvent::SftpLocalListed { path, entries } => {
@@ -5920,6 +6777,7 @@ impl StermAdminApp {
                 self.sftp_local_path_input
                     .update(cx, |f, cx| f.set_value(path, cx));
                 self.sftp_state.local_entries = entries;
+                self.sync_active_sftp_tab_from_state();
             }
             UiEvent::SftpRemoteListed {
                 session_id,
@@ -5934,12 +6792,23 @@ impl StermAdminApp {
                     }
                     self.sftp_state.remote_path = path.clone();
                     self.sftp_remote_path_input
-                        .update(cx, |f, cx| f.set_value(path, cx));
-                    self.sftp_state.remote_entries = entries;
+                        .update(cx, |f, cx| f.set_value(path.clone(), cx));
+                    self.sftp_state.remote_entries = entries.clone();
+                    self.sync_active_sftp_tab_from_state();
+                }
+                for tab in &mut self.sftp_tabs {
+                    if tab.id != self.active_sftp_tab_id
+                        && tab.state.session_id.as_deref() == Some(&session_id)
+                    {
+                        tab.state.loading_remote = false;
+                        tab.state.remote_path = path.clone();
+                        tab.state.remote_entries = entries.clone();
+                    }
                 }
             }
             UiEvent::SftpTransfer(progress) => {
                 self.sftp_state.upsert_transfer(progress);
+                self.sync_active_sftp_tab_from_state();
             }
             UiEvent::SftpRemoteTextLoaded {
                 session_id,
@@ -5983,8 +6852,14 @@ impl StermAdminApp {
                     .is_some_and(|r| !r.conflicts.is_empty());
                 self.set_toast(message, has_conflicts);
                 if report.is_none() {
+                    if let Ok(v) = self.services.vault.lock()
+                        && let Ok(st) = v.status()
+                    {
+                        self.vault_status = st;
+                    }
                     self.spawn_detect_local_ssh();
                     self.maybe_auto_sync(cx);
+                    self.restore_saved_sessions_if_enabled(cx);
                 }
             }
             UiEvent::SyncFailed(err) => {
@@ -6001,6 +6876,7 @@ impl StermAdminApp {
                 self.set_toast(message, false);
                 self.spawn_detect_local_ssh();
                 self.maybe_auto_sync(cx);
+                self.restore_saved_sessions_if_enabled(cx);
             }
             UiEvent::VaultActionFailed(err) => {
                 self.unlock_busy = false;
@@ -6134,6 +7010,15 @@ impl StermAdminApp {
                     self.set_toast(format!("Vault auto-locked after {mins}m of inactivity."), false);
                 }
             }
+            UiEvent::SystemSleepDetected { slept_secs } => {
+                if self.settings.lock_on_sleep && self.vault_status.unlocked {
+                    self.lock_vault(cx);
+                    self.set_toast(
+                        format!("Vault locked after system sleep ({slept_secs}s)."),
+                        false,
+                    );
+                }
+            }
             UiEvent::HostLatencies(results) => {
                 self.latency_probing = false;
                 for (id, rtt) in results {
@@ -6166,6 +7051,7 @@ impl StermAdminApp {
                 self.sftp_state.selected_local = None;
                 self.sftp_state.selected_local_paths.clear();
                 self.sftp_state.reset_local_scroll();
+                self.sync_active_sftp_tab_from_state();
                 self.set_toast(
                     format!("Mounted remote host '{host_label}' on Left SFTP pane."),
                     false,
@@ -6184,8 +7070,18 @@ impl StermAdminApp {
                     }
                     self.sftp_state.local_path = path.clone();
                     self.sftp_local_path_input
-                        .update(cx, |f, cx| f.set_value(path, cx));
-                    self.sftp_state.local_entries = entries;
+                        .update(cx, |f, cx| f.set_value(path.clone(), cx));
+                    self.sftp_state.local_entries = entries.clone();
+                    self.sync_active_sftp_tab_from_state();
+                }
+                for tab in &mut self.sftp_tabs {
+                    if tab.id != self.active_sftp_tab_id
+                        && tab.state.left_remote_session_id.as_deref() == Some(&session_id)
+                    {
+                        tab.state.loading_local = false;
+                        tab.state.local_path = path.clone();
+                        tab.state.local_entries = entries.clone();
+                    }
                 }
             }
             UiEvent::BiometricUnlockResult(res) => match res {
@@ -6374,7 +7270,7 @@ impl Render for StermAdminApp {
                             .when(collapsed, |el| {
                                 el.tooltip(StermTooltip::with_shortcut(
                                     "Quick Connect & Omnibar",
-                                    "Ctrl+K",
+                                    self.settings.keybindings.display(ShortcutAction::CommandPalette),
                                     t,
                                 ))
                             })
@@ -6397,7 +7293,11 @@ impl Render for StermAdminApp {
                                         .text_size(px(10.0))
                                         .font_family("Consolas")
                                         .text_color(t.text_muted)
-                                        .child("Ctrl+K"),
+                                        .child(
+                                            self.settings
+                                                .keybindings
+                                                .display(ShortcutAction::CommandPalette),
+                                        ),
                                 )
                             }),
                     )
@@ -6622,7 +7522,7 @@ impl Render for StermAdminApp {
                             .when(collapsed, |el| {
                                 el.tooltip(StermTooltip::with_shortcut(
                                     "Lock Vault",
-                                    "Ctrl+Shift+L",
+                                    self.settings.keybindings.display(ShortcutAction::LockVault),
                                     t,
                                 ))
                             })
@@ -6729,7 +7629,13 @@ impl Render for StermAdminApp {
                             })
                         });
                         let wid_sel = ws.id.clone();
+                        let wid_drag = ws.id.clone();
+                        let wid_drop = ws.id.clone();
                         let wid_close = ws.id.clone();
+                        let title_drag = ws.title.clone();
+                        let theme_mode_drag = self.settings.theme_mode;
+                        let accent_drop = t.accent;
+                        let close_sc = self.settings.keybindings.display(ShortcutAction::CloseTab);
 
                         div()
                             .id(("ws-tab", ix))
@@ -6766,6 +7672,29 @@ impl Render for StermAdminApp {
                                     s.bg(t.bg_subtle).text_color(t.text_primary)
                                 }
                             })
+                            .on_drag(
+                                DraggedWorkspaceTab {
+                                    tab_id: wid_drag,
+                                    label: title_drag,
+                                },
+                                move |dragged, pos, _, cx| {
+                                    cx.new(|_| {
+                                        DragTabPill::new(
+                                            dragged.label.clone(),
+                                            pos,
+                                            theme_mode_drag,
+                                        )
+                                    })
+                                },
+                            )
+                            .drag_over::<DraggedWorkspaceTab>(move |s, _, _, _| {
+                                s.border_color(accent_drop)
+                            })
+                            .on_drop(cx.listener(
+                                move |this, dragged: &DraggedWorkspaceTab, _, cx| {
+                                    this.reorder_workspace_tabs(&dragged.tab_id, &wid_drop, cx);
+                                },
+                            ))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.select_workspace_tab(Some(wid_sel.clone()), window, cx);
                             }))
@@ -6802,7 +7731,7 @@ impl Render for StermAdminApp {
                                     .hover(|s| s.bg(t.danger_soft).text_color(t.danger))
                                     .tooltip(StermTooltip::with_shortcut(
                                         "Close Tab",
-                                        "Ctrl+W",
+                                        close_sc,
                                         t,
                                     ))
                                     .on_mouse_down(MouseButton::Left, |_, _, cx| {
@@ -6906,6 +7835,13 @@ impl Render for StermAdminApp {
                             .text_color(t.text_secondary)
                             .cursor_pointer()
                             .hover(|s| s.bg(t.bg_subtle).text_color(t.text_primary))
+                            .tooltip(StermTooltip::with_shortcut(
+                                "Open Local Shell",
+                                self.settings
+                                    .keybindings
+                                    .display(ShortcutAction::OpenLocalShell),
+                                t,
+                            ))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.open_local_shell(None, None, Some(window), cx);
                             }))
@@ -7033,7 +7969,14 @@ impl Render for StermAdminApp {
 
 #[cfg(test)]
 mod tests {
-    use super::StermAdminApp;
+    use core_vault::models::{HostAuthMode, HostRecord};
+
+    use super::{
+        saved_node_from_split, split_node_from_saved, RestorePaneKind, SavedPaneNode,
+        SavedWorkspaceSession, SavedWorkspaceTab, StermAdminApp,
+    };
+    use crate::split_tree::{create_leaf, SplitDirection, SplitNode};
+    use crate::terminal::TerminalTab;
 
     #[test]
     fn parse_quick_target_handles_default_and_custom_ports() {
@@ -7048,5 +7991,183 @@ mod tests {
         assert_eq!(StermAdminApp::parse_quick_target("root@host:0"), None);
         assert_eq!(StermAdminApp::parse_quick_target("not-an-ssh-target"), None);
         assert_eq!(StermAdminApp::parse_quick_target("@host"), None);
+    }
+
+    #[test]
+    fn saved_workspace_session_roundtrip_and_split_conversion() {
+        let mut local = TerminalTab::local_shell(
+            "p-local".into(),
+            "PowerShell".into(),
+            "sid-local".into(),
+            "pwsh.exe".into(),
+        );
+        local.feed_bytes(b"\x1b]7;file://host/C:/Users/dev\x07");
+        let ssh_saved = TerminalTab::connecting(
+            "p-ssh".into(),
+            Some("host-1".into()),
+            "Prod".into(),
+            "10.0.0.1".into(),
+            22,
+            "root".into(),
+        );
+        let ssh_saved_2 = TerminalTab::connecting(
+            "p-ssh-2".into(),
+            Some("host-2".into()),
+            "Staging".into(),
+            "10.0.0.4".into(),
+            22,
+            "deploy".into(),
+        );
+        let ssh_deleted = TerminalTab::connecting(
+            "p-deleted".into(),
+            Some("host-missing".into()),
+            "Gone".into(),
+            "10.0.0.2".into(),
+            22,
+            "root".into(),
+        );
+        let ssh_adhoc = TerminalTab::connecting(
+            "p-adhoc".into(),
+            None,
+            "Adhoc".into(),
+            "10.0.0.3".into(),
+            22,
+            "root".into(),
+        );
+
+        let root = SplitNode::Split {
+            id: "s1".into(),
+            direction: SplitDirection::Vertical,
+            ratio: 0.65,
+            first: Box::new(create_leaf("p-local")),
+            second: Box::new(SplitNode::Split {
+                id: "s2".into(),
+                direction: SplitDirection::Horizontal,
+                ratio: 0.4,
+                first: Box::new(create_leaf("p-ssh")),
+                second: Box::new(SplitNode::Split {
+                    id: "s3".into(),
+                    direction: SplitDirection::Horizontal,
+                    ratio: 0.5,
+                    first: Box::new(create_leaf("p-deleted")),
+                    second: Box::new(SplitNode::Split {
+                        id: "s4".into(),
+                        direction: SplitDirection::Horizontal,
+                        ratio: 0.5,
+                        first: Box::new(create_leaf("p-ssh-2")),
+                        second: Box::new(create_leaf("p-adhoc")),
+                    }),
+                }),
+            }),
+        };
+
+        let saved_node = saved_node_from_split(
+            &root,
+            &[local, ssh_saved, ssh_saved_2, ssh_deleted, ssh_adhoc],
+        )
+        .unwrap();
+        let session = SavedWorkspaceSession {
+            tabs: vec![SavedWorkspaceTab {
+                title: "Work".into(),
+                root: saved_node,
+                broadcast_input: true,
+            }],
+            active_tab_index: Some(0),
+        };
+        let raw = serde_json::to_string(&session).unwrap();
+        let decoded: SavedWorkspaceSession = serde_json::from_str(&raw).unwrap();
+        assert_eq!(decoded.active_tab_index, Some(0));
+        assert!(decoded.tabs[0].broadcast_input);
+
+        let hosts = vec![
+            HostRecord {
+                id: "host-1".into(),
+                label: "Prod".into(),
+                hostname: "10.0.0.1".into(),
+                port: 22,
+                username: "root".into(),
+                group_id: None,
+                tags: Vec::new(),
+                credential_id: None,
+                jump_host_id: None,
+                terminal_theme: None,
+                keepalive_secs: 30,
+                startup_command: None,
+                notes: None,
+                auth_mode: HostAuthMode::Credential,
+                forward_agent: false,
+                proxy_url: None,
+                favorite: false,
+                last_connected_at: None,
+                updated_at: 0,
+            },
+            HostRecord {
+                id: "host-2".into(),
+                label: "Staging".into(),
+                hostname: "10.0.0.4".into(),
+                port: 22,
+                username: "deploy".into(),
+                group_id: None,
+                tags: Vec::new(),
+                credential_id: None,
+                jump_host_id: None,
+                terminal_theme: None,
+                keepalive_secs: 30,
+                startup_command: None,
+                notes: None,
+                auth_mode: HostAuthMode::Credential,
+                forward_agent: false,
+                proxy_url: None,
+                favorite: false,
+                last_connected_at: None,
+                updated_at: 0,
+            },
+        ];
+        let mut out_panes = Vec::new();
+        let rebuilt = split_node_from_saved(&decoded.tabs[0].root, &hosts, &mut out_panes).unwrap();
+        assert_eq!(out_panes.len(), 3);
+        assert!(matches!(
+            &out_panes[0].1,
+            RestorePaneKind::Local { program: Some(p), cwd: Some(c), .. }
+            if p == "pwsh.exe" && c.contains("Users/dev")
+        ));
+        assert!(matches!(
+            &out_panes[1].1,
+            RestorePaneKind::Ssh { host_id } if host_id == "host-1"
+        ));
+        assert!(matches!(
+            &out_panes[2].1,
+            RestorePaneKind::Ssh { host_id } if host_id == "host-2"
+        ));
+        match rebuilt {
+            SplitNode::Split {
+                direction: SplitDirection::Vertical,
+                ratio,
+                second,
+                ..
+            } => {
+                assert!((ratio - 0.65).abs() < f32::EPSILON);
+                match *second {
+                    SplitNode::Split {
+                        direction: SplitDirection::Horizontal,
+                        ratio: r2,
+                        ..
+                    } => assert!((r2 - 0.4).abs() < f32::EPSILON),
+                    other => panic!("expected inner horizontal split, got {other:?}"),
+                }
+            }
+            other => panic!("expected outer vertical split, got {other:?}"),
+        }
+
+        // Deleted host alone returns None cleanly
+        let deleted_only = SavedPaneNode::Leaf {
+            host_id: Some("host-missing".into()),
+            is_local: false,
+            local_shell_program: None,
+            local_shell_label: None,
+            local_cwd: None,
+        };
+        let mut none_panes = Vec::new();
+        assert!(split_node_from_saved(&deleted_only, &hosts, &mut none_panes).is_none());
     }
 }

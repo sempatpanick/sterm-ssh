@@ -12,9 +12,11 @@ use crate::app::{
 };
 use crate::command_suggestions::SuggestionSource;
 use crate::icons::{icon_svg, Icon};
+use crate::keybindings::ShortcutAction;
 use crate::motion::{indeterminate_bar, loading_dots, loading_dots_indexed};
 use crate::sftp::{
-    direction_arrow, transfer_percent, DragFilePill, DraggedSftpFile, SftpPaneSide,
+    direction_arrow, transfer_percent, DragFilePill, DragTabPill, DraggedSftpFile,
+    DraggedSftpTab, SftpPaneSide,
 };
 use crate::split_tree::{SplitDirection, SplitNode};
 use crate::theme::{env_badge_for_host, format_bytes, TerminalThemeId, ThemePalette};
@@ -2198,7 +2200,9 @@ impl StermAdminApp {
                                     .hover(|s| s.bg(t.bg_hover))
                                     .tooltip(StermTooltip::with_shortcut(
                                         "Command Suggestions",
-                                        "Ctrl+Space",
+                                        self.settings
+                                            .keybindings
+                                            .display(ShortcutAction::ToggleSuggestions),
                                         *t,
                                     ))
                                     .on_click(cx.listener(|this, _, _, cx| {
@@ -2231,7 +2235,9 @@ impl StermAdminApp {
                                     .hover(|s| s.bg(t.bg_hover))
                                     .tooltip(StermTooltip::with_shortcut(
                                         "Find in Terminal",
-                                        "Ctrl+F",
+                                        self.settings
+                                            .keybindings
+                                            .display(ShortcutAction::TerminalSearch),
                                         *t,
                                     ))
                                     .on_click(cx.listener(|this, _, _, cx| {
@@ -2469,7 +2475,9 @@ impl StermAdminApp {
                                     .hover(|s| s.bg(t.bg_hover))
                                     .tooltip(StermTooltip::with_shortcut(
                                         "Split Pane Horizontally",
-                                        "Ctrl+D",
+                                        self.settings
+                                            .keybindings
+                                            .display(ShortcutAction::SplitHorizontal),
                                         *t,
                                     ))
                                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -2497,7 +2505,9 @@ impl StermAdminApp {
                                     .hover(|s| s.bg(t.bg_hover))
                                     .tooltip(StermTooltip::with_shortcut(
                                         "Split Pane Vertically",
-                                        "Ctrl+Shift+D",
+                                        self.settings
+                                            .keybindings
+                                            .display(ShortcutAction::SplitVertical),
                                         *t,
                                     ))
                                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -3088,6 +3098,43 @@ impl StermAdminApp {
                             )
                             .child(
                                 div()
+                                    .id("sftp-drawer-follow")
+                                    .px_2()
+                                    .py_0p5()
+                                    .rounded_md()
+                                    .border_1()
+                                    .cursor_pointer()
+                                    .bg(if self.sftp_drawer_follow_cwd {
+                                        t.accent_soft
+                                    } else {
+                                        gpui::transparent_black()
+                                    })
+                                    .border_color(if self.sftp_drawer_follow_cwd {
+                                        t.accent
+                                    } else {
+                                        t.border
+                                    })
+                                    .text_size(px(10.0))
+                                    .text_color(if self.sftp_drawer_follow_cwd {
+                                        t.accent
+                                    } else {
+                                        t.text_muted
+                                    })
+                                    .tooltip(StermTooltip::text(
+                                        "Auto-follow terminal directory changes (OSC 7)",
+                                        *t,
+                                    ))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.toggle_sftp_drawer_follow_cwd(cx);
+                                    }))
+                                    .child(if self.sftp_drawer_follow_cwd {
+                                        "● Follow cd"
+                                    } else {
+                                        "○ Follow cd"
+                                    }),
+                            )
+                            .child(
+                                div()
                                     .id("sftp-drawer-up")
                                     .px_2()
                                     .py_0p5()
@@ -3103,6 +3150,26 @@ impl StermAdminApp {
                                         cx.notify();
                                     }))
                                     .child("↑"),
+                            )
+                            .child(
+                                div()
+                                    .id("sftp-drawer-term")
+                                    .px_1p5()
+                                    .py_0p5()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(t.border)
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(t.bg_hover))
+                                    .tooltip(StermTooltip::text("Open New SSH Terminal Here", *t))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        let cur = this.sftp_state.remote_path.clone();
+                                        this.open_remote_terminal_here(cur, Some(window), cx);
+                                    }))
+                                    .child(icon_svg(Icon::Terminal, 12.0, t.accent)),
                             )
                             .child(
                                 div()
@@ -3333,12 +3400,131 @@ impl StermAdminApp {
         let t_remote = *t;
         let theme_mode_local = self.settings.theme_mode;
         let theme_mode_remote = self.settings.theme_mode;
+        let theme_mode_tabs = self.settings.theme_mode;
+        let accent_tab_drop = t.accent;
+        let active_sftp_tab_id = self.active_sftp_tab_id.clone();
 
         div()
             .size_full()
             .flex()
             .flex_col()
             .gap_3()
+            // Multi-SFTP Tab Strip (drag-to-reorder + create/switch/close)
+            .child(
+                div()
+                    .id("sftp-tabs-bar")
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .overflow_x_scroll()
+                    .children(self.sftp_tabs.iter().enumerate().map(|(ix, tab)| {
+                        let active = tab.id == active_sftp_tab_id;
+                        let tid_sel = tab.id.clone();
+                        let tid_drag = tab.id.clone();
+                        let tid_drop = tab.id.clone();
+                        let tid_close = tab.id.clone();
+                        let label_drag = tab.label.clone();
+
+                        div()
+                            .id(("sftp-tab", ix))
+                            .px_2p5()
+                            .py_1()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(if active { t.accent } else { t.border })
+                            .bg(if active { t.accent_soft } else { t.bg_card })
+                            .text_color(if active {
+                                t.accent
+                            } else {
+                                t.text_secondary
+                            })
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .flex_shrink_0()
+                            .cursor_pointer()
+                            .hover(|s| {
+                                if active {
+                                    s
+                                } else {
+                                    s.bg(t.bg_subtle).text_color(t.text_primary)
+                                }
+                            })
+                            .on_drag(
+                                DraggedSftpTab {
+                                    sftp_tab_id: tid_drag,
+                                    label: label_drag,
+                                },
+                                move |dragged, pos, _, cx| {
+                                    cx.new(|_| {
+                                        DragTabPill::new(
+                                            dragged.label.clone(),
+                                            pos,
+                                            theme_mode_tabs,
+                                        )
+                                    })
+                                },
+                            )
+                            .drag_over::<DraggedSftpTab>(move |s, _, _, _| {
+                                s.border_color(accent_tab_drop)
+                            })
+                            .on_drop(cx.listener(
+                                move |this, dragged: &DraggedSftpTab, _, cx| {
+                                    this.reorder_sftp_tabs(&dragged.sftp_tab_id, &tid_drop, cx);
+                                },
+                            ))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.select_sftp_tab(tid_sel.clone(), cx);
+                            }))
+                            .child(icon_svg(
+                                Icon::Files,
+                                11.0,
+                                if active { t.accent } else { t.text_muted },
+                            ))
+                            .child(tab.label.clone())
+                            .child(
+                                div()
+                                    .id(("sftp-tab-close", ix))
+                                    .ml_0p5()
+                                    .px_1()
+                                    .rounded_sm()
+                                    .text_size(px(10.0))
+                                    .text_color(t.text_muted)
+                                    .hover(|s| s.bg(t.danger_soft).text_color(t.danger))
+                                    .tooltip(StermTooltip::text("Close SFTP Tab", *t))
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation();
+                                    })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.close_sftp_tab(tid_close.clone(), cx);
+                                    }))
+                                    .child("✕"),
+                            )
+                    }))
+                    .child(
+                        div()
+                            .id("sftp-tab-new")
+                            .px_2p5()
+                            .py_1()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(t.border)
+                            .bg(t.bg_card)
+                            .text_xs()
+                            .text_color(t.text_muted)
+                            .flex_shrink_0()
+                            .cursor_pointer()
+                            .hover(|s| s.border_color(t.accent).text_color(t.accent))
+                            .tooltip(StermTooltip::text("New SFTP Tab", *t))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.new_sftp_tab(cx);
+                            }))
+                            .child("+"),
+                    ),
+            )
             // Top SFTP Host Connection Bar (NO 6-host cap!)
             .child(
                 div()
@@ -3542,6 +3728,32 @@ impl StermAdminApp {
                                                     }),
                                             )
                                         },
+                                    )
+                                    .child(
+                                        div()
+                                            .id("sftp-loc-term")
+                                            .px_1p5()
+                                            .py_0p5()
+                                            .rounded_md()
+                                            .border_1()
+                                            .border_color(t.border)
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .cursor_pointer()
+                                            .hover(|s| s.bg(t.bg_hover))
+                                            .tooltip(StermTooltip::text(
+                                                if left_is_remote {
+                                                    "Open SSH Terminal Here"
+                                                } else {
+                                                    "Open Local Terminal Here"
+                                                },
+                                                *t,
+                                            ))
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.open_local_terminal_here(window, cx);
+                                            }))
+                                            .child(icon_svg(Icon::Terminal, 12.0, t.accent)),
                                     )
                                     .child(
                                         div()
@@ -3938,6 +4150,35 @@ impl StermAdminApp {
                                             )
                                         },
                                     )
+                                    .when(connected, |el| {
+                                        el.child(
+                                            div()
+                                                .id("sftp-rem-term")
+                                                .px_1p5()
+                                                .py_0p5()
+                                                .rounded_md()
+                                                .border_1()
+                                                .border_color(t.border)
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .cursor_pointer()
+                                                .hover(|s| s.bg(t.bg_hover))
+                                                .tooltip(StermTooltip::text(
+                                                    "Open SSH Terminal Here",
+                                                    *t,
+                                                ))
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    let cur = this.sftp_state.remote_path.clone();
+                                                    this.open_remote_terminal_here(
+                                                        cur,
+                                                        Some(window),
+                                                        cx,
+                                                    );
+                                                }))
+                                                .child(icon_svg(Icon::Terminal, 12.0, t.accent)),
+                                        )
+                                    })
                                     .child(
                                         div()
                                             .id("sftp-rem-ref")
@@ -4047,6 +4288,7 @@ impl StermAdminApp {
                                                         let perms = entry.permissions.unwrap_or(0o644);
                                                         let p_del = entry.path.clone();
                                                         let n_del = entry.name.clone();
+                                                        let p_term = entry.path.clone();
 
                                                         div()
                                                             .id(("rem-row", vis_ix))
@@ -4311,6 +4553,59 @@ impl StermAdminApp {
                                                                                     },
                                                                                 ))
                                                                                 .child("Ext"),
+                                                                        )
+                                                                    })
+                                                                    .when(is_dir, |el| {
+                                                                        el.child(
+                                                                            div()
+                                                                                .id((
+                                                                                    "rem-term",
+                                                                                    vis_ix,
+                                                                                ))
+                                                                                .px_1()
+                                                                                .py_0p5()
+                                                                                .rounded_sm()
+                                                                                .flex()
+                                                                                .items_center()
+                                                                                .justify_center()
+                                                                                .hover(|s| {
+                                                                                    s.bg(
+                                                                                        t_remote
+                                                                                            .accent_soft,
+                                                                                    )
+                                                                                })
+                                                                                .tooltip(
+                                                                                    StermTooltip::text(
+                                                                                        "Open SSH Terminal in Folder",
+                                                                                        t_remote,
+                                                                                    ),
+                                                                                )
+                                                                                .on_mouse_down(
+                                                                                    MouseButton::Left,
+                                                                                    |_, _, cx| {
+                                                                                        cx.stop_propagation();
+                                                                                    },
+                                                                                )
+                                                                                .on_click(
+                                                                                    cx.listener(
+                                                                                        move |this,
+                                                                                              _,
+                                                                                              window,
+                                                                                              cx| {
+                                                                                            cx.stop_propagation();
+                                                                                            this.open_remote_terminal_here(
+                                                                                                p_term.clone(),
+                                                                                                Some(window),
+                                                                                                cx,
+                                                                                            );
+                                                                                        },
+                                                                                    ),
+                                                                                )
+                                                                                .child(icon_svg(
+                                                                                    Icon::Terminal,
+                                                                                    11.0,
+                                                                                    t_remote.accent,
+                                                                                )),
                                                                         )
                                                                     })
                                                                     .child(

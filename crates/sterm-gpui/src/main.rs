@@ -2,6 +2,7 @@ mod app;
 mod backend;
 mod command_suggestions;
 mod icons;
+mod keybindings;
 mod local_shell;
 mod modals;
 mod motion;
