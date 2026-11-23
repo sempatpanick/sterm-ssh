@@ -144,12 +144,21 @@ impl HoveredUrl {
 #[derive(Debug, Clone)]
 struct Osc8LinkEntry {
     is_alt: bool,
-    /// Absolute row indices (`scrollback_len + discarded_rows + row` in normal screen,
-    /// or `row` in alternate screen), with inclusive `(start_col, end_col)`.
-    abs_spans: Vec<(usize, u16, u16)>,
+    spans: Vec<Osc8Span>,
     url: String,
-    /// Sampled first non-space character of the link so cleared/overwritten cells don't false-match.
-    anchor_char: Option<(usize, u16, char)>,
+}
+
+#[derive(Debug, Clone)]
+struct Osc8Span {
+    abs_row: usize,
+    start_col: u16,
+    cells: Vec<vt100::Cell>,
+}
+
+impl Osc8Span {
+    fn end_col(&self) -> u16 {
+        self.start_col + self.cells.len() as u16 - 1
+    }
 }
 
 /// Tracks OSC 8 terminal hyperlinks and OSC 7 current working directory notifications.
@@ -238,47 +247,96 @@ impl Osc8Tracker {
             if entry.is_alt != is_alt {
                 continue;
             }
-            if !entry
-                .abs_spans
-                .iter()
-                .any(|&(r, sc, ec)| r == target_abs && col >= sc && col <= ec)
-            {
+            if !entry.spans.iter().any(|span| {
+                span.abs_row == target_abs && (span.start_col..=span.end_col()).contains(&col)
+            }) {
                 continue;
             }
 
-            // Verify screen wasn't cleared/overwritten over the anchor cell
-            if let Some((ar, ac, expected_ch)) = entry.anchor_char
-                && ar >= base && ar < base + rows {
-                    let vis_r = (ar - base) as u16;
-                    let actual_ch = screen
-                        .cell(vis_r, ac)
-                        .and_then(|c| c.contents().chars().next())
-                        .unwrap_or(' ');
-                    if actual_ch != expected_ch {
-                        continue;
-                    }
-                }
-
-            let spans: Vec<(u16, u16, u16)> = entry
-                .abs_spans
+            // A terminal application may have erased or rewritten part of the label.
+            let spans = entry
+                .spans
                 .iter()
-                .filter_map(|&(abs_r, sc, ec)| {
-                    if abs_r >= base && abs_r < base + rows {
-                        Some(((abs_r - base) as u16, sc, ec))
-                    } else {
-                        None
+                .filter_map(|span| {
+                    if !(base..base + rows).contains(&span.abs_row) {
+                        return None;
                     }
+                    let vis_row = (span.abs_row - base) as u16;
+                    (span.start_col..=span.end_col())
+                        .zip(&span.cells)
+                        .all(|(col, expected)| screen.cell(vis_row, col) == Some(expected))
+                        .then_some((vis_row, span.start_col, span.end_col()))
                 })
                 .collect();
 
-            if !spans.is_empty() {
-                return Some(HoveredUrl {
-                    spans,
-                    url: entry.url.clone(),
-                });
+            let link = HoveredUrl {
+                spans,
+                url: entry.url.clone(),
+            };
+            if link.contains(row, col) {
+                return Some(link);
             }
         }
         None
+    }
+
+    fn finish_link(&mut self, screen: &mut vt100::Screen, end_row: usize, end_col: u16) {
+        let Some((is_alt, start_row, start_col, url)) = self.active.take() else {
+            return;
+        };
+        if is_alt != screen.alternate_screen() || (start_row, start_col) >= (end_row, end_col) {
+            return;
+        }
+
+        let saved_offset = screen.scrollback();
+        let live_top = self.abs_row(screen, 0);
+        let oldest = if is_alt { 0 } else { self.discarded_rows };
+        let cols = screen.size().1.get();
+        let mut spans = Vec::new();
+        for abs_row in start_row.max(oldest)..=end_row {
+            screen.set_scrollback(live_top.saturating_sub(abs_row));
+            let row = (abs_row - self.visible_base_abs_row(screen)) as u16;
+            let start = if abs_row == start_row { start_col } else { 0 };
+            let end = if abs_row == end_row {
+                end_col.min(cols)
+            } else {
+                cols
+            };
+            let mut cells: Vec<_> = (start..end)
+                .filter_map(|col| screen.cell(row, col).cloned())
+                .collect();
+            while cells
+                .last()
+                .is_some_and(|cell| !cell.has_contents() && !cell.is_wide_continuation())
+            {
+                cells.pop();
+            }
+            if !cells.is_empty() {
+                spans.push(Osc8Span {
+                    abs_row,
+                    start_col: start,
+                    cells,
+                });
+            }
+        }
+        screen.set_scrollback(saved_offset);
+
+        if !spans.is_empty() {
+            self.links.retain(|link| {
+                link.is_alt != is_alt
+                    || !link.spans.iter().any(|old| {
+                        spans.iter().any(|new| {
+                            old.abs_row == new.abs_row
+                                && old.start_col <= new.end_col()
+                                && new.start_col <= old.end_col()
+                        })
+                    })
+            });
+            self.links.push(Osc8LinkEntry { is_alt, spans, url });
+            if self.links.len() > 128 {
+                self.links.remove(0);
+            }
+        }
     }
 }
 
@@ -298,78 +356,15 @@ impl vt100::Callbacks for Osc8Tracker {
         if params.first().copied() != Some(b"8") || params.len() < 3 {
             return;
         }
-        let uri = params[2..]
-            .iter()
-            .map(|p| String::from_utf8_lossy(p))
-            .collect::<Vec<_>>()
-            .join(";")
-            .trim()
-            .to_string();
-        let is_alt = screen.alternate_screen();
-        let (cur_row, cur_col) = screen.cursor_position();
-        let cur_abs_row = self.abs_row(screen, cur_row);
-        let (rows_nz, cols_nz) = screen.size();
-        let max_col = cols_nz.get().saturating_sub(1);
+        let (row, col) = screen.cursor_position();
+        let abs_row = self.abs_row(screen, row);
+        self.finish_link(screen, abs_row, col);
 
-        if uri.is_empty() {
-            if let Some((start_alt, sr, sc, url)) = self.active.take() {
-                if start_alt != is_alt {
-                    return;
-                }
-                let mut abs_spans = Vec::new();
-                if cur_abs_row == sr {
-                    if cur_col > sc {
-                        abs_spans.push((sr, sc, (cur_col - 1).min(max_col)));
-                    }
-                } else if cur_abs_row > sr {
-                    abs_spans.push((sr, sc, max_col));
-                    for r in (sr + 1)..cur_abs_row {
-                        abs_spans.push((r, 0, max_col));
-                    }
-                    if cur_col > 0 {
-                        abs_spans.push((cur_abs_row, 0, (cur_col - 1).min(max_col)));
-                    }
-                }
-                if !abs_spans.is_empty() {
-                    let base = self.abs_row(screen, 0);
-                    let rows = rows_nz.get() as usize;
-                    let mut anchor_char = None;
-                    'find_anchor: for &(ar, s_col, e_col) in &abs_spans {
-                        if ar >= base && ar < base + rows {
-                            let vis_r = (ar - base) as u16;
-                            for c in s_col..=e_col {
-                                if let Some(ch) = screen
-                                    .cell(vis_r, c)
-                                    .and_then(|cell| cell.contents().chars().next())
-                                    && !ch.is_whitespace() {
-                                        anchor_char = Some((ar, c, ch));
-                                        break 'find_anchor;
-                                    }
-                            }
-                        }
-                    }
-
-                    self.links.retain(|l| {
-                        l.is_alt != is_alt
-                            || !l.abs_spans.iter().any(|(r, sc0, ec0)| {
-                                abs_spans.iter().any(|(nr, sc1, ec1)| {
-                                    nr == r && sc0 <= ec1 && sc1 <= ec0
-                                })
-                            })
-                    });
-                    self.links.push(Osc8LinkEntry {
-                        is_alt,
-                        abs_spans,
-                        url,
-                        anchor_char,
-                    });
-                    if self.links.len() > 128 {
-                        self.links.remove(0);
-                    }
-                }
-            }
-        } else if uri.starts_with("http://") || uri.starts_with("https://") {
-            self.active = Some((is_alt, cur_abs_row, cur_col, uri));
+        let uri = params[2..].join(&b';');
+        if let Ok(uri) = std::str::from_utf8(&uri)
+            && is_web_url(uri)
+        {
+            self.active = Some((screen.alternate_screen(), abs_row, col, uri.to_owned()));
         }
     }
 
@@ -784,6 +779,12 @@ impl TerminalTab {
         } else {
             self.clamp_or_clear_selection();
         }
+        if let Some(hovered) = self.hovered_url.take()
+            && let Some(&(row, col, _)) = hovered.spans.first()
+            && self.url_at(row, col).as_ref() == Some(&hovered)
+        {
+            self.hovered_url = Some(hovered);
+        }
     }
 
     pub fn append_system_line(&mut self, line: &str) {
@@ -1091,6 +1092,7 @@ impl TerminalTab {
     pub fn scroll_to_bottom(&mut self) {
         if self.parser.screen().scrollback() > 0 {
             self.parser.screen_mut().set_scrollback(0);
+            self.hovered_url = None;
         }
     }
 
@@ -1099,7 +1101,10 @@ impl TerminalTab {
         let current = screen.scrollback() as i32;
         let max_scroll = screen.scrollback_len() as i32;
         let next = (current + delta_lines).clamp(0, max_scroll) as usize;
-        screen.set_scrollback(next);
+        if next != current as usize {
+            screen.set_scrollback(next);
+            self.hovered_url = None;
+        }
     }
 
     fn measured_cell_width(&self, font_size: f32) -> f32 {
@@ -1685,36 +1690,85 @@ impl TerminalTab {
         }
     }
 
-    /// Detects either an OSC 8 hyperlink OR a single/multi-line wrapped `http(s)://` URL at `(row, col)`.
-    pub fn url_at(&self, row: u16, col: u16) -> Option<HoveredUrl> {
+    /// Detects an OSC 8 link or a plain web URL at a visible terminal cell.
+    pub fn url_at(&mut self, row: u16, col: u16) -> Option<HoveredUrl> {
         let screen = self.parser.screen();
-        let (rows_nz, cols_nz) = screen.size();
-        let rows = rows_nz.get();
-        let cols = cols_nz.get();
-        if row >= rows || col >= cols {
+        let (rows, cols) = screen.size();
+        if row >= rows.get() || col >= cols.get() {
+            return None;
+        }
+        if let Some(link) = self.parser.callbacks().find_at(screen, row, col) {
+            return Some(link);
+        }
+
+        let cell = screen.cell(row, col)?;
+        if !cell.is_wide_continuation() && !cell.contents().chars().next().is_some_and(is_url_char)
+        {
             return None;
         }
 
-        // 1. Prefer explicit OSC 8 hyperlinks (e.g. "→ Click here to authenticate"), including in scrollback
-        if let Some(osc_link) = self.parser.callbacks().find_at(screen, row, col) {
-            return Some(osc_link);
-        }
-
-        // 2. Snapshot visible rows and detect single-line AND multi-line wrapped URLs
-        let mut grid_rows: Vec<Vec<char>> = Vec::with_capacity(rows as usize);
-        for r in 0..rows {
-            let mut row_chars = Vec::with_capacity(cols as usize);
-            for c in 0..cols {
-                let ch = screen
-                    .cell(r, c)
-                    .and_then(|cell| cell.contents().chars().next())
-                    .unwrap_or(' ');
-                row_chars.push(ch);
+        let saved_offset = screen.scrollback();
+        let base = self.visible_base_abs_row();
+        let live_top = base + saved_offset;
+        let (first, last) = self.logical_line_bounds(base + row as usize);
+        let mut line = String::new();
+        let mut visible_cells = Vec::new();
+        let mut target_byte = None;
+        for abs_row in first..=last {
+            if self.abs_row_to_vis(abs_row).is_none() {
+                self.parser
+                    .screen_mut()
+                    .set_scrollback(live_top.saturating_sub(abs_row));
             }
-            grid_rows.push(row_chars);
+            let screen_row = self
+                .abs_row_to_vis(abs_row)
+                .expect("logical line row is in the buffer");
+            let screen = self.parser.screen();
+            let visible_row = (base..base + rows.get() as usize)
+                .contains(&abs_row)
+                .then(|| (abs_row - base) as u16);
+            for start_col in 0..cols.get() {
+                let Some(cell) = screen.cell(screen_row, start_col) else {
+                    continue;
+                };
+                if cell.is_wide_continuation() {
+                    continue;
+                }
+                let byte = line.len();
+                if let Some(visible_row) = visible_row {
+                    let end_col = start_col + u16::from(cell.is_wide());
+                    visible_cells.push((byte, visible_row, start_col, end_col));
+                    if visible_row == row && (start_col..=end_col).contains(&col) {
+                        target_byte = Some(byte);
+                    }
+                }
+                if cell.has_contents() {
+                    line.push_str(cell.contents());
+                } else {
+                    line.push(' ');
+                }
+            }
         }
+        self.parser.screen_mut().set_scrollback(saved_offset);
 
-        find_url_in_grid(&grid_rows, row, col)
+        let url_range = find_web_url(&line, target_byte?)?;
+        let mut spans: Vec<(u16, u16, u16)> = Vec::new();
+        for (_, row, start_col, end_col) in visible_cells
+            .into_iter()
+            .filter(|(byte, ..)| url_range.contains(byte))
+        {
+            if let Some((last_row, _, last_col)) = spans.last_mut()
+                && *last_row == row
+            {
+                *last_col = end_col;
+            } else {
+                spans.push((row, start_col, end_col));
+            }
+        }
+        Some(HoveredUrl {
+            spans,
+            url: line[url_range].to_owned(),
+        })
     }
 
     /// Renders all visible VT100 rows using GPUI `StyledText` with coalesced ANSI highlights,
@@ -2043,140 +2097,89 @@ impl TerminalTab {
 
 fn is_url_char(ch: char) -> bool {
     !ch.is_whitespace()
+        && !ch.is_control()
         && !matches!(ch, '<' | '>' | '"' | '\'' | '`')
         && !('\u{2500}'..='\u{257F}').contains(&ch)
 }
 
-/// Returns `(first_non_space_col, last_non_space_col_exclusive)` if the row has non-space content.
-fn row_non_space_bounds(chars: &[char]) -> Option<(usize, usize)> {
-    let first = chars.iter().position(|c| !c.is_whitespace())?;
-    let last = chars.iter().rposition(|c| !c.is_whitespace())?;
-    Some((first, last + 1))
+fn web_scheme_end(text: &str) -> Option<usize> {
+    ["https://", "http://"].into_iter().find_map(|scheme| {
+        text.get(..scheme.len())?
+            .eq_ignore_ascii_case(scheme)
+            .then_some(scheme.len())
+    })
 }
 
-/// Finds a single-line or multi-line wrapped `http://` / `https://` URL covering `(target_row, target_col)`.
-fn find_url_in_grid(
-    grid: &[Vec<char>],
-    target_row: u16,
-    target_col: u16,
-) -> Option<HoveredUrl> {
-    let total_rows = grid.len();
-    for r in 0..total_rows {
-        let chars = &grid[r];
-        let line: String = chars.iter().collect();
-        let mut search_from = 0usize;
+fn is_web_url(text: &str) -> bool {
+    let Some(scheme_end) = web_scheme_end(text) else {
+        return false;
+    };
+    // The URL parser accepts missing authorities and browser-style backslash normalization.
+    text[scheme_end..]
+        .chars()
+        .next()
+        .is_some_and(|ch| !matches!(ch, '/' | '?' | '#'))
+        && !text
+            .chars()
+            .any(|ch| ch.is_whitespace() || ch.is_control() || ch == '\\')
+        && reqwest::Url::parse(text).is_ok_and(|url| url.has_host())
+}
 
-        while search_from < line.len() {
-            let rest = &line[search_from..];
-            let next_https = rest.find("https://");
-            let next_http = rest.find("http://");
-            let rel = match (next_https, next_http) {
-                (Some(a), Some(b)) => a.min(b),
-                (Some(a), None) => a,
-                (None, Some(b)) => b,
-                (None, None) => break,
-            };
-
-            let start_byte = search_from + rel;
-            let start_col = line[..start_byte].chars().count();
-
-            let mut end_col = start_col;
-            while end_col < chars.len() && is_url_char(chars[end_col]) {
-                end_col += 1;
-            }
-
-            let mut spans: Vec<(u16, u16, u16)> = Vec::new();
-            let mut full_url = String::new();
-            if end_col > start_col {
-                spans.push((r as u16, start_col as u16, (end_col - 1) as u16));
-                full_url.extend(&chars[start_col..end_col]);
-            }
-
-            // Check if the URL ran all the way to the last non-space char on row `r`
-            // (covers both terminal soft-wrap AND CLI hard-wrap at e.g. 80 cols).
-            let reached_row_content_end = row_non_space_bounds(chars)
-                .map(|(_, last_end)| end_col >= last_end)
-                .unwrap_or(false);
-
-            if reached_row_content_end {
-                let mut next_r = r + 1;
-                while next_r < total_rows {
-                    let next_chars = &grid[next_r];
-                    let Some((nf, nl)) = row_non_space_bounds(next_chars) else {
-                        break;
-                    };
-                    // Continuation must start near left margin (same indent or col 0)
-                    if nf > start_col.saturating_add(2) {
-                        break;
-                    }
-                    let slice = &next_chars[nf..nl];
-                    // Continuation line of a wrapped URL must be one contiguous URL token
-                    // (no internal spaces/quotes) and not start a new scheme.
-                    if !slice.iter().all(|&c| is_url_char(c)) {
-                        break;
-                    }
-                    let seg: String = slice.iter().collect();
-                    if seg.starts_with("http://") || seg.starts_with("https://") {
-                        break;
-                    }
-                    // Reject horizontal divider lines (e.g. "──────────" or "==========")
-                    if slice.iter().all(|&c| matches!(c, '─' | '-' | '=' | '_' | '━' | '*')) {
-                        break;
-                    }
-
-                    spans.push((next_r as u16, nf as u16, (nl - 1) as u16));
-                    full_url.push_str(&seg);
-                    next_r += 1;
-                }
-            }
-
-            // Trim trailing sentence punctuation or unmatched closing brackets from the final span
-            while let Some(last_ch) = full_url.chars().last() {
-                let trim = match last_ch {
-                    '.' | ',' | ';' | ':' | '!' | '?' => true,
-                    ')' => {
-                        full_url.chars().filter(|&c| c == ')').count()
-                            > full_url.chars().filter(|&c| c == '(').count()
-                    }
-                    ']' => {
-                        full_url.chars().filter(|&c| c == ']').count()
-                            > full_url.chars().filter(|&c| c == '[').count()
-                    }
-                    '}' => {
-                        full_url.chars().filter(|&c| c == '}').count()
-                            > full_url.chars().filter(|&c| c == '{').count()
-                    }
-                    _ => false,
-                };
-                if trim {
-                    full_url.pop();
-                    if let Some(last_span) = spans.last_mut() {
-                        if last_span.2 > last_span.1 {
-                            last_span.2 -= 1;
-                        } else {
-                            spans.pop();
-                        }
-                    }
-                } else {
-                    break;
-                }
-            }
-
-            let min_len = if full_url.starts_with("https://") { 9 } else { 8 };
-            if full_url.len() >= min_len && !spans.is_empty() {
-                let candidate = HoveredUrl {
-                    spans,
-                    url: full_url,
-                };
-                if candidate.contains(target_row, target_col) {
-                    return Some(candidate);
-                }
-            }
-
-            search_from = start_byte + 7;
+fn find_web_url(line: &str, target: usize) -> Option<Range<usize>> {
+    let token_start = line[..target]
+        .char_indices()
+        .rev()
+        .find(|&(_, ch)| !is_url_char(ch))
+        .map_or(0, |(offset, ch)| offset + ch.len_utf8());
+    let token_end = target
+        + line[target..]
+            .find(|ch| !is_url_char(ch))
+            .unwrap_or(line.len() - target);
+    for (offset, _) in line[token_start..token_end].match_indices(['h', 'H']) {
+        let start = token_start + offset;
+        if start > target {
+            break;
+        }
+        let text = &line[start..token_end];
+        if web_scheme_end(text).is_none()
+            || line[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.' | '_'))
+        {
+            continue;
+        }
+        let candidate = trim_url_end(text);
+        if is_web_url(candidate) {
+            let range = start..start + candidate.len();
+            return range.contains(&target).then_some(range);
         }
     }
     None
+}
+
+fn trim_url_end(mut text: &str) -> &str {
+    let pairs = [('(', ')'), ('[', ']'), ('{', '}')];
+    let mut balance = None;
+    while let Some(ch) = text.chars().next_back() {
+        if let Some(index) = pairs.iter().position(|&(_, close)| close == ch) {
+            let balance = balance.get_or_insert_with(|| {
+                pairs.map(|(open, close)| {
+                    text.chars()
+                        .map(|c| i32::from(c == close) - i32::from(c == open))
+                        .sum::<i32>()
+                })
+            });
+            if balance[index] <= 0 {
+                break;
+            }
+            balance[index] -= 1;
+        } else if !matches!(ch, '.' | ',' | ';' | ':' | '!' | '?') {
+            break;
+        }
+        text = &text[..text.len() - ch.len_utf8()];
+    }
+    text
 }
 
 /// Converts a GPUI `Keystroke` into bytes to transmit over the SSH PTY channel.
@@ -2635,7 +2638,7 @@ mod tests {
     }
 
     #[test]
-    fn detects_multiline_wrapped_oauth_url() {
+    fn detects_soft_wrapped_oauth_url() {
         let mut tab = TerminalTab::connecting(
             "t3".into(),
             None,
@@ -2644,16 +2647,60 @@ mod tests {
             22,
             "root".into(),
         );
+        assert!(tab.resize(32, 4));
         tab.feed_bytes(
-            b"\x1b[2J\x1b[HOpen URL:\r\nhttps://accounts.google.com/o/oauth2/auth?client_id=123\r\n456&scope=openid&state=xyz\r\n\r\nDone",
+            b"https://accounts.google.com/o/oauth2/auth?client_id=123456&scope=openid&state=xyz done",
         );
-        // Hovering row 2 (continuation line!) must return the complete joined URL across rows 1 and 2
         let found = tab.url_at(2, 5).expect("expected wrapped URL on row 2");
         assert_eq!(
             found.url,
             "https://accounts.google.com/o/oauth2/auth?client_id=123456&scope=openid&state=xyz"
         );
-        assert_eq!(found.spans.len(), 2);
+        assert_eq!(found.spans.len(), 3);
+    }
+
+    #[test]
+    fn detects_url_across_viewport_edges_and_wide_cells() {
+        let mut tab = TerminalTab::connecting(
+            "url".into(),
+            None,
+            "srv".into(),
+            "127.0.0.1".into(),
+            22,
+            "root".into(),
+        );
+        assert!(tab.resize(20, 4));
+        let url = "HTTPS://example.org/界e\u{301}/path#part";
+        tab.feed_bytes(
+            format!("line\r\nline\r\nline\r\nline\r\n{url}\r\nend\r\nline\r\nlast").as_bytes(),
+        );
+        let found = tab
+            .url_at(0, 1)
+            .expect("wide continuation cell belongs to URL");
+        assert_eq!(found.url, url);
+        assert!(found.contains(0, 0));
+
+        tab.scroll_lines(4);
+        assert_eq!(tab.url_at(3, 0).unwrap().url, url);
+        assert_eq!(tab.scrollback_offset(), 4);
+    }
+
+    #[test]
+    fn avoids_joining_hard_lines_or_detecting_invalid_urls() {
+        let mut tab = TerminalTab::connecting(
+            "url".into(),
+            None,
+            "srv".into(),
+            "127.0.0.1".into(),
+            22,
+            "root".into(),
+        );
+        tab.feed_bytes(b"\x1b[2J\x1b[Hhttps://example.org/path\r\nDone\r\nhttps:///\r\nnothttps://example.org\r\nhttps://[::1]/");
+        assert_eq!(tab.url_at(0, 5).unwrap().url, "https://example.org/path");
+        assert!(tab.url_at(1, 0).is_none());
+        assert!(tab.url_at(2, 0).is_none());
+        assert!(tab.url_at(3, 5).is_none());
+        assert_eq!(tab.url_at(4, 10).unwrap().url, "https://[::1]/");
     }
 
     #[test]
@@ -2671,6 +2718,46 @@ mod tests {
         );
         let found = tab.url_at(0, 6).expect("expected OSC 8 hyperlink");
         assert_eq!(found.url, "https://accounts.google.com/auth");
+        tab.feed_bytes(b"\x1b[1;7Hother");
+        assert!(tab.url_at(0, 6).is_none());
+    }
+
+    #[test]
+    fn osc8_switch_to_unsupported_scheme_closes_previous_link() {
+        let mut tab = TerminalTab::connecting(
+            "url".into(),
+            None,
+            "srv".into(),
+            "127.0.0.1".into(),
+            22,
+            "root".into(),
+        );
+        tab.feed_bytes(b"\x1b[2J\x1b[H\x1b]8;;https://example.org\x1b\\web\x1b]8;;file:///tmp/other\x1b\\local\x1b]8;;\x1b\\");
+        assert_eq!(tab.url_at(0, 1).unwrap().url, "https://example.org");
+        assert!(tab.url_at(0, 4).is_none());
+    }
+
+    #[test]
+    fn osc8_link_keeps_its_spans_in_scrollback() {
+        let mut tab = TerminalTab::connecting(
+            "url".into(),
+            None,
+            "srv".into(),
+            "127.0.0.1".into(),
+            22,
+            "root".into(),
+        );
+        assert!(tab.resize(20, 4));
+        tab.feed_bytes(
+            b"\x1b[2J\x1b[H12345678901234567890\x1b]8;;HTTPS://example.org/a;b\x07a linked label\r\nnext\x1b]8;;\x07\r\nother\r\nlast",
+        );
+        tab.scroll_lines(1);
+        let found = tab
+            .url_at(2, 1)
+            .expect("visible part of scrolled OSC 8 link");
+        assert_eq!(found.url, "HTTPS://example.org/a;b");
+        assert_eq!(found.spans, [(1, 0, 13), (2, 0, 3)]);
+        assert!(tab.url_at(1, 14).is_none());
     }
 
     #[test]
